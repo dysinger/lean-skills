@@ -95,6 +95,15 @@ interpreters with **explicit `match`, not `do` notation** — `do` desugars to
 goal like `(do let __discr ← .ok (a, r); …) = …` gets stuck. Nested `match`
 is definitionally transparent and closes by `rfl`.
 
+**Name the substrate and the transport differently.** Give the proof substrate a
+*reducible alias* (`abbrev Bytes : Type := List UInt8`), so every `List` lemma
+applies for free (a *newtype* would block the `simp` reduction the proofs live
+on). Give the packed executable surface a *distinct* newtype (`structure Buffer
+where byteArray : ByteArray`) — "proof model" and "run model" are different types
+with different questions, not two names for one thing. Route the transport
+`toBytes`/`ofBytes` through `Buffer.byteArray.data` (the stored `Array`) rather
+than `ByteArray.toList` (see changelog).
+
 **`Except.ok a >>= f` reduces to `f a`** by `rfl` (`Except.bind` is a `match`)
 — but only if you are *not* in `do` notation. Use it to keep roundtrip proofs
 mechanical.
@@ -295,6 +304,46 @@ Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
 ## Changelog
+
+- 2026-10-11 — **A `lean_exe` only generates a C `main` when its `main` is at the
+  top level (root namespace), not inside a `namespace`.** Lake's executable target
+  links the C `main`/`_lean_main` entry from a `main : IO Unit` bound in the module's
+  *root* namespace; a `main` declared inside `namespace Foo` compiles to
+  `lp_Foo_main___boxed` with no `_lean_main` symbol, and the link fails `entry point
+  (_main) undefined`. Put the `main` at top level and qualify the helpers it calls
+  (`Foo.doIt`), or `open Foo in`. This is distinct from the library build, which
+  links no entry point and never surfaces the issue.
+- 2026-10-11 — **An "efficient decoder" can be planned in provability tiers.** When a
+  backtracking/list decoder must become faster *without* changing its denotation,
+  split the work by proof cost: **Tier A** = list-fusion + a full-consumption
+  `Option` specialization of the repetition decoder, whose equality to the spec
+  closes by `List` equations + `WellFounded.fix_eq` (the same machinery the naïeve
+  spec already uses); **Tier B** = a memoizing/chart (DP over positions), which needs
+  a numbering of `(sub-description, position)` and an equality proof likely beyond
+  `rfl`/`simp`. Ship Tier A (provable, `[propext, Quot.sound]`) first; keep Tier B a
+  separate change rather than stalling the practical win on the hard proof. A
+  `HashMap`-keyed memoization is the wrong first move: `Codec` is a structural value
+  (no cheap nominal identity) and `Std.HashMap` brings `BEq`/`Hashable`/FFI
+  obligations that break the `rfl`/`simp` style.
+- 2026-10-11 — **Prefer an explicit `match` over `Option.map` for a transport
+  definition whose law you must `simp`/`rfl`; there is no `Option.map_eq_some` in
+  core.** `Option.map f o = some b ↔ ∃ a, o = some a ∧ b = f a` has no named lemma
+  and does not `rfl` (the `some` case leaves `f a = b ↔ b = f a`); write
+  `match o with | none => none | some a => some (f a)` instead, so the transport
+  law (`o.map f = some b ↔ …`) closes by `cases o <;> simp` + `rw [eq_comm]`.
+- 2026-10-11 — **`ByteArray.toList` is opacity, but `ByteArray.data` (an `Array`)
+  reduces; route the transport through `.data.toList`, never `.toList`.** When
+  transporting a `List`-proved core onto a `ByteArray`, `(ByteArray.mk a).toList`
+  does **not** reduce to `a.toList` (FFI), but `(ByteArray.mk a).data.toList` is
+  `rfl` (because `ByteArray.data` is the stored `Array`, and `Array.toList` is
+  `self.1`). Writing `toBytes b := b.byteArray.data.toList` makes the round-trip
+  `toBytes (ofBytes l) = l` close by `rfl`. Prefer wrapping the *reducible* `Array`
+  over the `ByteArray` for any law you must `simp`/`rfl`.
+- 2026-10-11 — **A `structure` newtype auto-generates no `ext` in one-field form;
+  use `congrArg Mk` + the field's own extensionality.** `structure Foo where a : Nat`
+  yields no `Foo.ext` constant; prove `x = y` as `congrArg Foo.mk (…)` (or `cases`
+  both sides). And `abbrev X := List UInt8` without an explicit `: Type` can fail
+  to infer — write `abbrev X : Type := List UInt8`.
 
 - 2026-10-11 — **`/-!`/`/--` block comments are *terminated* by the byte pair
   `-/`, even nested inline.** The text `left-/right-associative` (a `-` immediately
