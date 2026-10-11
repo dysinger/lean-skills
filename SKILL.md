@@ -67,6 +67,11 @@ comment above the first `import` fails with "invalid `import` command, it must
 be used in the beginning of the file". Put a plain `/- … -/` block (or `--`
 lines) before imports, and reserve `-!` docs for *after* them.
 
+**A `-` immediately before `/` (`-/`) *closes* the `/-!`/`/--` comment early.**
+Write `left- or right-associative`, never `left-/right-associative`, inside a doc
+comment: the `-/` byte pair terminates the block at that point and the rest of
+that line parses as code.
+
 ---
 
 ## 2. Proving over primitives
@@ -291,13 +296,42 @@ names/paths); the specific repo lives elsewhere.
 
 ## Changelog
 
+- 2026-10-11 — **`/-!`/`/--` block comments are *terminated* by the byte pair
+  `-/`, even nested inline.** The text `left-/right-associative` (a `-` immediately
+  before `/`) closes the enclosing doc comment at that point, so the rest of the
+  line parses as code (`unexpected identifier` at the `/`). Avoid a `-` directly
+  before `/` in doc/`-!` text — write `left- or right-associative`, `left/right`,
+  `a and b`, etc. This is the same lexer rule as closing a `/-` comment; doc
+  comments are not special-cased.
+- 2026-10-11 — **`subst` eliminates the variable on the *right* of the equality,
+  even when both sides are locals.** For `h : ax = x₀` (both introduced by
+  `cases`/`rcases`), `subst h` substitutes `x₀ := ax` (kills `x₀`), surprising you
+  when `x₀` is a case-analysis variable you wanted to keep. To control direction
+  deterministically, derive the projections with `congrArg` and `cases` them:
+  `have h1 : ax = x₀ := congrArg Prod.fst h; cases h1` substitutes `ax := x₀` and
+  keeps `x₀`. For a cons/cons equality `ax :: rest' = x₀ :: rest`, `cases h1`
+  substitutes *both* `ax := x₀` and `rest' := rest` in one step (via `noConfusion`),
+  unlike `subst` which would require two `injection` + `subst` rounds and still get
+  the direction wrong.
+- 2026-10-11 — **`rw` does *not* beta-reduce a `match`, so rewriting a scrutinee
+  leaves the arm's pattern binders shadowing yours; use `simp` to reduce.** After
+  `cases h : (foldl …).unapply a` and `rw [h] at he`, a goal
+  `(match some (a₀, ops) with | some (a₀, ops) => …endcode arg a₀… ) = some s`
+  keeps the *arm's* `a₀`/`ops` (shadowing your `rcases`-bound ones), so a later
+  `rw [ha : encode arg a₀ = …] at he` finds "no occurrence". `simp [h] at he`
+  (not `rw`) additionally reduces the `match` on the constructor literal, which
+  beta-substitutes the scrutinee into the arm and unshadowes the binders. In
+  `cases <h> : e`, the `h` records `e = constructor` but does **not** rewrite `e`
+  anywhere (not in hypotheses, not in the goal) — rewrite/simp it yourself.
 - 2026-10-11 — `partial def` generates **no equation and cannot be unfolded**:
   `#check f.eq_1` is unknown and `unfold f` fails, so a denotation built by
   `match` on a `partial` description value (`Rel (many p)`) is irreducibly stuck —
   an equality like `Rel (many p) xs s ↔ relRepeat (Rel p) xs s` is *unprovable*.
   The honest reading of "derived recursive combinator, total as a denotation" is:
   the denotation is a separate total relation (`relRepeat`), never `Rel` applied to
-  a `partial` `Codec`.
+  a `partial` `Codec`. (Follow-up: the remedy that actually ships is to delete the
+  `partial` value and expose *three* total functions — a relation, a well-founded
+  decoder, and a structural encoder — rather than any `Codec`-typed value.)
 - 2026-10-11 — `termination_by` wraps the function body in `have f := <arg>` house-
   keeping, so `unfold f; rw [WellFounded.fix_eq]; rfl` leaves a stray `have` and a
   same-goal mismatch. For a `def` whose recursion equation you need to prove by
