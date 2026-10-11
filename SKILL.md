@@ -104,6 +104,40 @@ with different questions, not two names for one thing. Route the transport
 `toBytes`/`ofBytes` through `Buffer.byteArray.data` (the stored `Array`) rather
 than `ByteArray.toList` (see changelog).
 
+**A transport *barrier* is not a faster run model — write a native array recursion +
+prove it equal (the F* two-tier split).** A `decodeBuffer` defined as `(decode d
+b.toBytes).map …` still materializes the whole `List` and runs the list interpreter, so it
+keeps the `List` cons-cell cost. The F*/miTLS/EverCrypt move is to (a) keep the pure spec
+over `List`/`Bytes`, (b) define the *run model* natively over an `Array` + a `Nat` index —
+`decodeArray d a i : List (α × Nat)` reading `a[i]`, remainder an index, never cons-peeling a
+byte list — and (c) prove **one** refinement lemma `decodeArray_eq : decodeArray d a i
+≡ decode d (a.data.drop i)` by induction on `d` + `Array`↔`List` lemmas. Every spec-level law
+then transfers by `rw [decodeArray_eq]`; you never re-prove `roundtrip`/`decode_spec`. Use
+**`Array UInt8` (via `ByteArray.data`), never `ByteArray` itself**, as the run-model carrier:
+`a.data`/`List.toArray`/`Array.toList` reduce under `simp`/`rfl`, while `ByteArray.get!`/
+`.extract` are FFI-opaque and stall every law (the `lean`-skill §2 rule). This is the
+"work faster without FFI/compiler" tier; the "fastest possible" (compiler/`@[extern]`) is a
+separate, later change.
+
+**`WellFounded.fix` + an outer `match` on the input produces an unreducible two-arg
+`match s, ih` — and the `ih` argument type fixes `s` to the scrutinee.** A `fix` body
+written `(fun s ih => match s with | [] => … | b :: rest => … ih rest …)` elaborates to
+`match s, ih with`, and `rw [WellFounded.fix_eq]` then `cases s` leaves `match [], …`
+*not* reduced — the `ih`'s relation type mentions the match-scrutinee (`head✝ :: tail✝`), not
+the outer `s`, so subsequent `simp`/`change`/`rfl` stall. Fixes that work: (a) avoid the outer
+match entirely — write the `[]` base case as the *empty-list* branch of the recursion's own
+list argument (as `decodeRepeat` does with ``([], s) :: …``); or (b) if the match is
+authentic, pass the *scrutinee term* (`b :: rest`) — not the outer binder `s` — to the helper
+so the `ih` type and helper's `s` parameter are syntactically the same term. Test the base
+leaf (`some [] ≠ none`) with `unfold …; rw [WellFounded.fix_eq]; change some [] ≠ none; simp`
+rather than `rfl`, because the negated/monadic goal does not reduce the `match` on its own.
+
+**`List.mem_attach l a : a ∈ l.attach` takes the whole Subtype, not the proof.** To show
+`⟨(x, s₁), hm⟩ ∈ l.attach`, write `List.mem_attach l ⟨(x, s₁), hm⟩` where the argument is the
+`{ p // p ∈ l }` element; it is a *theorem* (not a constructor or iff), so do not project
+`.2` off it. Conversely `List.mem_flatMap`/`List.mem_map`/`List.mem_filterMap` are **not**
+`[simp]` — `rw` them explicitly when destructuring an `attach`-ed `flatMap`.
+
 **`Except.ok a >>= f` reduces to `f a`** by `rfl` (`Except.bind` is a `match`)
 — but only if you are *not* in `do` notation. Use it to keep roundtrip proofs
 mechanical.
