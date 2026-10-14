@@ -119,6 +119,32 @@ then transfers by `rw [decodeArray_eq]`; you never re-prove `roundtrip`/`decode_
 "work faster without FFI/compiler" tier; the "fastest possible" (compiler/`@[extern]`) is a
 separate, later change.
 
+**The compiler/`@[extern]` tier: two `@[extern]` forms, and prefer the one with an
+elaborating body.** To splice trusted, GC-less C into an already-proved run model without
+touching the extraction pipeline, `@[extern]` has *two* shapes: (1) `opaque`/`constant`
+(no Lean body — pure trust, nothing reduces in proofs), and (2) **`def` with an elaborating
+body** — the stdlib `ByteArray` pattern (`@[extern "lean_byte_array_fget",
+implicit_reducible] def get … | ⟨bs⟩, i, _ => bs[i]` in `Init/Data/ByteArray/Basic.lean`:
+`size → lean_sarray_size`, `get! → lean_byte_array_get`, `copySlice → lean_byte_array_copy_slice`,
+`hash → lean_byte_array_hash`). Shape (2) is the right tool for a proven codec: the Lean body
+still elaborates and reduces, so refinement lemmas keep closing `[propext, Quot.sound]`-only,
+and the C symbol is a *named, isolated trust seam* (the F\*/KaRaMeL `[@@noextract_to "krml"]
+// primitive` posture). Verify the emitted `.lake/build/ir/<Module>.c` actually calls the
+symbol (not the body).
+
+**"GC-less C" is a type-mapping decision, not a runtime you write.** Lean's one C generator
+(`Lean.Compiler.LCNF.EmitC`) emits a boxed/GC'd representation unconditionally (`Nat`→bignum
+`lean_object *`, `List`→cons cells + RC, closures→`lean_alloc_closure`), and `EmitLLVM.lean` is
+the other backend — there is no stock "unboxed C" target. F\*'s KaRaMeL shows the no-GC shape:
+generated C links only `krmllib.h` (macros + typedefs), machine ints → `uint8_t`/`uint32_t`/…,
+`Prims_string` → `const char *`, byte slice → `{uint32_t length; const char *data;}`, heap =
+libc `malloc`/`free`, stack `push_frame` = plain C stack, **no GC anywhere**. The mechanism is
+primitive *type mapping* (`[@@noextract_to "krml"] // primitive`), which is exactly Lean's
+`@[extern]` idea applied to types. A real Lean equivalent = a new backend (`EmitNoGC`/`EmitCStar`
++ a representation/boxing pass + a driver flag) at the `EmitC`/`EmitLLVM` seam, i.e. a *compiler
+backend*, not a `lake` library; the `@[extern]` fast path (shape 2) is the stopgap that lands
+first.
+
 **`WellFounded.fix` + an outer `match` on the input produces an unreducible two-arg
 `match s, ih` — and the `ih` argument type fixes `s` to the scrutinee.** A `fix` body
 written `(fun s ih => match s with | [] => … | b :: rest => … ih rest …)` elaborates to
@@ -332,6 +358,101 @@ evaluable.
 
 ---
 
+## 6. Lake build customization (`@[extern]` C FFI link, script lakefile)
+
+**Linking hand-written C into a `lean_exe` needs a script `lakefile.lean`, not
+TOML.** The TOML `[[lean_lib]]`/`[[lean_exe]]` DSL has no way to *compile* a
+`.c` — `extern_lib` needs a custom `getPath` build that TOML cannot express. The
+script form can declare a `target` that compiles the C to an object and add it
+via `moreLinkObjs`:
+
+```lean
+import Lake
+open Lake DSL
+open System
+
+package codec
+
+target externFastPathO (pkg) : FilePath := do
+  let oFile := pkg.buildDir / "ExternFastPath.o"
+  let srcFile := pkg.dir / "Codec" / "ExternFastPath.c"
+  buildLeanO oFile (Job.pure srcFile)
+
+lean_exe bench where
+  root := `Bench
+  moreLinkObjs := #[externFastPathO]
+```
+
+Key facts, each a non-obvious gotcha:
+
+- **`target x (pkg) : FilePath := …` names the package binder explicitly** — the
+  default (no binder) is `_`, so `pkg.dir`/`pkg.buildDir` (the `Package` API, e.g.
+  `Package.buildDir = dir / config.buildDir`) need `(pkg)`.
+- **`buildLeanO`/`compileO` (in `Lake.Build.Common`/`Lake.Build.Actions`) are the
+  compile step**; `buildLeanO` takes `leanIncludeDir?`/`lean.cc`/`ccFlags` from the
+  Lean install, i.e. `leanc` with `-I …/include` (so `#include <lean/lean.h>` resolves)
+  and the matching flags — reusing it reproduces exactly how Lake compiles its own
+  generated `.c`. `buildO` is the raw `cc` variant (you supply `-I`/flags).
+- **`Job.pure srcFile` (not a bare path) is the `buildLeanO` source argument**;
+  `FilePath`/`String` are `OptDataKind` so `Job.pure` works, and the result of the
+  `target` body is a `SpawnM (Job FilePath)` that lifts to `FetchM (Job FilePath)`
+  (the `MonadLift SpawnM JobM` + `MonadLift JobM FetchM` chain) — no manual wrapping.
+- **`@[default_target]` is how you set the bare-`lake build` target in a `.lean`
+  lakefile.** The TOML `defaultTargets = ["x"]` key maps to **`LakefileConfig`**
+  (a TOML-only config), *not* `PackageConfig` — so `package codec where defaultTargets
+  := …` warns "unknown 'PackageConfig' field" and does nothing. Tag the target
+  (`@[default_target] lean_lib codec`). `PackageConfig` does have a `defaultTargets`
+  field, but the attribute is the maintained path.
+- **`leanc` self-resolves its C compiler.** Running `leanc --print-cflags` / `leanc -c`
+  works with a minimal `PATH` (it invokes the clang wrapper baked in from the stdenv that
+  built `lean4`, so `cc`/`clang` need not be on `PATH`). This means a Nix `bench`
+  derivation's `nativeBuildInputs = [ lean4 ]` suffices to compile the `.c` via
+  `buildLeanO` at `lake build bench` time.
+- **A flake/`default.nix` `src = ./.` uses the *git tree*, so untracked files are
+  absent from the Nix build.** A `lakefile.lean` (or any new module) must be
+  git-tracked before `nix build`/`flake` sees it; the failure is `lake` printing
+  "no configuration file with a supported extension" for *both* `lakefile.lean` and
+  `lakefile.toml`.
+
+---
+
+## 7. "Work faster": carrier swap > FFI > compiler (and lean on `USize`)
+
+**Before authoring a compiler backend or `@[extern]` C, change the *result
+carrier* — it is usually the whole lever and it needs no new trust.** The
+"speedup" question has a strict cheaper-to-harder order, and the first two steps
+are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
+
+1. **Carrier swap.** The hot loop is almost never the cost; the cost is the
+   `List UInt8` of boxed cons cells (and bignum `Nat` boxes) the API *returns*.
+   Define a packed, `USize`-indexed, slice/span-returning surface
+   (`decode … : … → Option (α × USize)`, full-consumption returning the packed
+   buffer) instead of `… → List (α × Nat)`, and prove it equal to the `List`
+   spec by the same refinement lemma you already write for the carrier swap.
+   This removes the allocation that dominates the profile.
+2. **Scalar indices.** `USize` (and `UInt64`/`UInt8`/…) **is** a scalar in Lean's
+   IR; bignum `Nat` is an `lean_object *`. A function indexed by `USize` already
+   codegens to a `size_t`/`ulong` loop under the *existing* `EmitC` — near-C with
+   no representation fiction. This is the decisive fact the "erase `Nat → size_t`"
+   compiler plan misses: you get unboxed indices by *typing them `USize` in source*,
+   not by asking a backend to erase a bignum.
+3. **`@[extern]` FFI** only *if* a stdlib primitive already exists to shim — and
+   verify it actually adds anything; stdlib `ByteArray.get`/`size`/`push`/
+   `copySlice` are already `@[extern]` C, so a hand-written wrapper over them is a
+   no-op. (Measured lesson: a `@[extern]` "fast path" that only re-wraps stdlib
+   externs gives no speedup and should be recorded as such, not as a win.)
+4. **A compiler backend** is the *last* resort, and its "unboxed C" story is only
+   sound for a *source* subset already written in scalars (`USize`/`UInt64`) and
+   first order — never "erase `Nat`/`WellFounded.fix`", which is a semantic
+   change the IR cannot express (`WellFounded.fix` threads a higher-order `ih`;
+   it is backtracking search, not a tail loop).
+
+**The rule:** measure *what actually costs* (usually the result allocation, not
+ the byte loop) before choosing a layer; pick the cheapest layer that removes
+ *that* cost; record the measured outcome honestly even when it is "no speedup".
+
+---
+
 ## Append new learnings here
 
 Date-stamped, one line each, latest first. Keep entries generic (no project
@@ -339,6 +460,95 @@ names/paths); the specific repo lives elsewhere.
 
 ## Changelog
 
+- 2026-10-14 — **Length-indexed byte strings (`Fin n → UInt8`) as the single carrier: base-case
+  type incoherence, the `splice`=cast-of-`concat` trick, and well-founded recursion on the
+  type index.** When a `List α` spec becomes a length-indexed `Bytes n := Fin n → UInt8`, three
+  non-obvious moves show up (all `[propext, Quot.sound]`-only):
+  - *Base cases go type-incoherent.* `Rel (pure x₀) x s = (x = x₀ ∧ s = emptyBytes)` does not
+    typecheck, because `s : Bytes n` vs `emptyBytes : Bytes 0` forces `n = 0`. Restate the base
+    case as the *length predicate* (`pure ↦ x = x₀ ∧ n = 0`; `relRepeat [] ↦ n = 0`) or carry the
+    cast (`byte ↦ ∃ h : n = 1, h ▸ s = single b`), and expose an `emptyBytes_unique`/
+    `eq_empty_of_remaining_zero` transport lemma for the one place you need `s = emptyBytes`.
+  - *The `seq` split should be defined as the cast of `concat`.*
+    `splice {n m} (hm : m ≤ n) (s₁ : Bytes m) (s₂ : Bytes (n - m)) : Bytes n :=
+    cast (congrArg Bytes (by rw [Nat.add_comm]; exact Nat.sub_add_cancel hm)) (concat s₁ s₂)`.
+    Defining it *as the cast of `concat`* (not a bespoke `if i.val < m …`) makes `splice hm s₁ s₂
+    = concat s₁ s₂` a one-line `splice_eq_concat`, so `encode_rel`'s `seq` case closes by
+    definition. Note `cast` wants a *type* equality `Bytes … = Bytes …`, so wrap the `Nat` proof
+    in `congrArg Bytes` (and its witness is `Nat.sub_add_cancel`, not `omega` over `m + (n-m) = n`).
+  - *Well-founded recursion moves to the type index `n`.* `decodeRepeat`/`decodeFull` recurse on
+    `n` (the length of `s : Bytes n`), so the `fix` runs over `Sigma fun n => Bytes n` with measure
+    `.1`, and the *proof* uses `Nat.strongRecOn n` (stdlib strong induction — `Nat.strong_induction_on`
+    does **not** exist) after `revert xs s` so `s : Bytes n` stays under the `∀` in a type-correct
+    motive. `dsimp` often turns a named `dite` into a plain `ite`; `split_ifs` no longer exists in
+    Lean 4.34 and `if_neg` is deprecated (`ite_eq_right` is the replacement), and `rw [ite_eq_right hn]`
+    can still split into a spurious `inl.refl` — prefer `cases n` on the `Nat` when the goal's `n` must
+    rewrite hypotheses too.
+
+- 2026-10-13 — **"Work faster" = carrier swap, not a compiler or more FFI; `USize` is the
+  scalar you already have.** The dominant cost in a `List`-returning decoder is the `List`
+  cons cells + bignum `Nat` boxes at the *API edge*, not the byte loop (which stdlib
+  `@[extern]`s already make `memcpy`-fast). Two failed moves confirm it: (1) a
+  `@[extern]` C "fast path" that only re-wrapped stdlib externs gave no speedup (the loop
+  was already C); (2) a "new GC-less backend" plan (`Nat→size_t`, `WellFounded.fix`→loop)
+  was architected-wrong — bignum `Nat` is an `lean_object *` not a scalar, and
+  `WellFounded.fix` threads a higher-order `ih` (backtracking search, not a tail loop), so
+  erasing them is a *semantic* change the IR cannot express. The fix is a **packed,
+  `USize`-indexed, slice/`ByteArray`-span-returning surface** — because `USize` *is* a
+  scalar, the existing `EmitC` already emits a `size_t` loop, so you get near-C with **no
+  backend and no new trust**, and the refinement to the `List` spec is the same
+  `[propext, Quot.sound]`-only lemma you already write for a carrier swap. (Generic; see
+  §7.)
+
+- 2026-10-12 — **Choose the `@[extern]` *body* so the contract law is `rfl`-provable
+  `[propext, Quot.sound]`-only; don't route it through a stdlib lemma that pulls in
+  `Classical.choice`.** When an `@[extern]` primitive's *executed* C is a tight loop but its
+  Lean body must still elaborate (so refinement lemmas hold), the body can be a *different,
+  simpler, `rfl`-reducible* term with the same meaning — the C (code-generated) and the body
+  (proof-only) need only *agree*. Concretely: `byteSlice a i := a.extract i a.size` forces the
+  contract lemma `(byteSlice a i).data.toList = a.data.toList.drop i` through stdlib
+  `Array.toList_extract`/`List.toArray_drop`, which depend on `[propext, Classical.choice,
+  Quot.sound]` (`omega` over `Nat.min`/`sub`). Writing the body `ByteArray.mk
+  ((a.data.toList.drop i).toArray)` makes the same contract `rfl` (over the reducible
+  `Array`/`List` pair) — `[propext, Quot.sound]`-only, no `Classical.choice`. Corollary:
+  `omega` itself is constructive and does *not* add `Classical.choice` (the existing
+  `DecodeByteArray` laws use it and stay `[propext, Quot.sound]`) — it is specific stdlib
+  `Array`↔`List` `extract` lemmas that do. Also: `ByteArray.size` is `| ⟨bs⟩ => bs.size`
+  (a pattern match), so `(ByteArray.mk x).size` does not `simp`-reduce — use
+  `unfold ByteArray.size` (or `ByteArray.size_data : a.data.size = a.size`).
+
+- 2026-10-12 — **Linking hand-written `@[extern]` C into a `lean_exe`: script
+  `lakefile.lean`, a `target + buildLeanO` object, and `moreLinkObjs`.** The TOML
+  lakefile cannot express a custom C *compile* step (`extern_lib` needs a Lean-side
+  `getPath`); a script lakefile can declare `target x (pkg) : FilePath := do buildLeanO
+  oFile (Job.pure srcFile)` and attach it via `lean_exe … where moreLinkObjs := #[x]`.
+  Non-obvious: the `target` package binder defaults to `_` (name it `(pkg)` to use
+  `pkg.dir`/`pkg.buildDir`); the TOML `defaultTargets` maps to `LakefileConfig`, *not*
+  `PackageConfig` — in a `.lean` lakefile use `@[default_target]` on the lib instead;
+  `buildLeanO` compiles with `leanc` (gives `-I …/include` for `lean.h` + flags), and
+  `leanc` self-resolves its clang without `cc` on `PATH`; `Job.pure` (not a bare path) is
+  the src arg, and the `SpawnM (Job FilePath)` body lifts to `FetchM` via the `MonadLift`
+  chain. A flake/`default.nix` `src = ./.` uses the *git tree*, so a new `lakefile.lean`
+  must be tracked before `nix build` sees it. (Generic; see also the `@[extern]` entry
+  below.)
+  library; and "GC-less C" = a type-mapping/compiler-backend decision, not a runtime.**
+  Lean's only C generator (`Lean.Compiler.LCNF.EmitC`) boxes *everything* — `Nat`→bignum
+  `lean_object *` (`lean_nat_add`/`lean_nat_dec_lt`), `List`→cons cells with
+  `lean_inc_ref`/`lean_dec_ref`, closures→`lean_alloc_closure`; `IR/EmitLLVM.lean` is the
+  other backend, and there is no stock unboxed-C target. Two `@[extern]` shapes exist:
+  (1) `opaque`/`constant` (no body, pure trust), (2) `def` with an *elaborating* body
+  (stdlib `ByteArray.get` pattern — body reduces for proofs, codegen calls the C symbol).
+  Shape (2) keeps refinement lemmas `[propext, Quot.sound]`-only and the C is a *named trust
+  seam* (F\*/KaRaMeL `// primitive` posture). "No GC / no runtime C" is what KaRaMeL emits:
+  `krmllib.h` (macros+typedefs only), machine ints→`uint8_t`/`uint32_t`, `Prims_string`→
+  `const char *`, byte slice→`{uint32_t length; const char *data;}`, heap=libc `malloc`/`free`,
+  **no GC anywhere** — the mechanism is primitive *type mapping*, which is `@[extern]` applied
+  to types. A real Lean equivalent = a new backend (`EmitNoGC`/`EmitCStar` + boxing pass +
+  driver flag) at the `EmitC`/`EmitLLVM` seam (a compiler backend, not a `lake` lib); the
+  `@[extern]` fast path (shape 2) is the cheaper stopgap that lands first and validates the
+  `memchr` baseline + `(ptr,len)` slice representation before the full backend is built.
+  (Source studied: `../fstar` `v2026.09.20` Pulse C lib `Pulse.C.Types.*`; `../karamel`
+  `DESIGN.md`/`include/krmllib/*`/`src/AstToCStar.ml`.)
 - 2026-10-11 — **A `lean_exe` only generates a C `main` when its `main` is at the
   top level (root namespace), not inside a `namespace`.** Lake's executable target
   links the C `main`/`_lean_main` entry from a `main : IO Unit` bound in the module's
