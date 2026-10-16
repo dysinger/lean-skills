@@ -460,6 +460,61 @@ names/paths); the specific repo lives elsewhere.
 
 ## Changelog
 
+- 2026-10-15 — **The REAL cast-reduction trap with length-indexed carriers: the *inline*
+  `show … by rw …; exact …` proof inside a `cast (congrArg F e)` is un-matchable — name it first.
+  (Corrects the 2026-10-14 entry below, which misdiagnosed the cause as "opaque `omega` terms";
+  `omega` itself is fine and constructive.) When a length-indexed `Bytes n := Fin n → UInt8`
+  defines `splice`/`prepend` via `cast (congrArg Bytes <Nat-eq>)`, writing `<Nat-eq>` as an
+  *inline* `show m + (n-m) = n by rw [Nat.add_comm]; exact Nat.sub_add_cancel hm` produces a
+  `have`-wrapped proof term (`Eq.mpr`/`let`-bound) that **no** `rw`/`simp` can structurally unify
+  against a cast-reduction lemma's `e : n = m` binder — `simp only [cast_bytes_val']` reports
+  "made no progress", even with the bare-`Fin` LHS form. The fix is **not** a different lemma
+  shape or proof-irrelevance gymnastics; it is to **hoist the proof into a named constant**:
+  `theorem splice_add {n m} (hm : m ≤ n) : m + (n-m) = n := by rw [Nat.add_comm]; exact Nat.sub_add_cancel hm`
+  and write `cast (congrArg Bytes (splice_add hm))`. A named `e` unifies cleanly; then the
+  `.symm`-aware cast lemmas below fire. Corollaries for the same carrier:
+  - *The `decode`/`encode` laws need a `.symm`-aware cast lemma for BOTH `Fin` and `Bytes`.*
+    `splice`/`prepend` produce `cast (Eq.symm (congrArg Fin e)) i` and
+    `cast (Eq.symm (congrArg Bytes e)) f`, but the stock lemmas match only the positive form
+    `cast (congrArg Fin e) i`. Add `cast_fin_symm {n m} (e : m = n) (i : Fin n) :
+    cast (Eq.symm (congrArg Fin e)) i = ⟨i.val, ·⟩` and the analogous `cast_bytes_val_symm`;
+    both are `rfl` after `cases e` (a `Nat` equality `cases` cleanly — it is *not* the
+    "`cases (Fin n = Fin m)` dependent-elimination failure" trap).
+  - *Prove the clean `+`-associativity first, then transport.* A `concat`-associativity law
+    `concat s₁ (concat s₂ s₃) = cast (congrArg Bytes (Nat.add_assoc a b c)) (concat (concat s₁ s₂) s₃)`
+    closes directly by `apply Bytes.ext; intro i; unfold concat; rw [cast_bytes_val' (e := Nat.add_assoc a b c)];
+    simp; by_cases; omega` (no `Nat.sub` at all). State the *derived* `prepend`/`splice` law in
+    terms of this primitive rather than re-expanding `Nat.sub` casts.
+  - *A `concat`/`prepend` associativity law over a `Suffix` (prefix+remainder) carrier needs a
+    hypothesis linking the two remains.* `(trans t₁ t₂).prepend (concat s₁ s₂) = t₁.prepend s₁`
+    is **false** without `h : t₂.prepend s₂ = t₁.bytes` — the suffix region reads `t₂.bytes` on
+    one side and `t₁.bytes` on the other. If a composition law looks "obviously" true pointwise
+    but won't close, check whether a reconstruction-of-the-middle hypothesis is missing (the
+    analogue of an induction hypothesis leaking out of a `seq` decode); without it the two sides
+    genuinely differ.
+
+- 2026-10-14 — **The cast-argument matching trap: `rw`/`simp` cannot match a cast-reduction
+  lemma's `e : n = m` binder against an opaque `omega`-generated proof, so normalize the
+  proof first via proof irrelevance.** When a length-indexed carrier (`Bytes n := Fin n → UInt8`)
+  makes `splice`/`concat`/`prepend` cast at `congrArg Bytes e` for arithmetic `e` (e.g.
+  `Nat.sub_sub_self h`, `(n−m₁)+(m₁−m₂)=n−m₂`), the cast-reduction lemmas
+  (`cast (congrArg Bytes e) f i = f ⟨i.val, ·⟩`) will **not** fire through `rw`/`simp` —
+  `rw [cast_bytes_val']` leaves a `case e ⊢ n = m` side goal even when `e` is *in scope as a
+  variable*, and `simp` reports "made no progress", because the lemma's `e` binder must be
+  *structurally* unified with a proof term that `omega`/`by` made opaque. Two consequences:
+  - *The bare-`Fin`-variable form is the right LHS, not the `⟨k, hk⟩` form.*
+    `cast_bytes_val' {n m} (e : n = m) (f : Bytes n) (i : Fin m)` (a variable projection LHS)
+    fires where `cast_bytes_val (… ⟨k, hk⟩)` cannot, because a compound index
+    `⟨(cast … i).val − m, ·⟩` will not unify with `⟨k, hk⟩`. But it still needs `e` *named* —
+    `rw [cast_bytes_val' (e := e)]` works only when `e` is a local variable.
+  - *The real fix is to normalize the proof first, then reduce.* Use proof irrelevance for
+    `Nat` equality (`Nat.eq_irrel {n m} (e₁ e₂ : n = m) : e₁ = e₂ := Subsingleton.elim e₁ e₂`,
+    `[propext]`-only) to replace the opaque proof with a named one *in place*:
+    `congr 2; exact Nat.eq_irrel e₁ e₂`, then `simp only [cast_bytes_val']`, then `omega`.
+  This is the one general move that makes an entire family of cast-heavy length-indexed laws
+  close mechanically — do not switch the representation to move the cast elsewhere (that
+  trades a proof-side cost for a hot-path cost), and do not hand-`rcases` each `Nat` (unscalable).
+
 - 2026-10-14 — **Length-indexed byte strings (`Fin n → UInt8`) as the single carrier: base-case
   type incoherence, the `splice`=cast-of-`concat` trick, and well-founded recursion on the
   type index.** When a `List α` spec becomes a length-indexed `Bytes n := Fin n → UInt8`, three
