@@ -460,6 +460,80 @@ names/paths); the specific repo lives elsewhere.
 
 ## Changelog
 
+- 2026-10-16 — **A length-indexed `Bytes n := Fin n → UInt8` carrier needs a family of
+  *cast-commutation* lemmas — each is a pointwise `Bytes.ext` + `splice_apply` + one
+  `cast_fin_symm` rewrite, then a `n - …`-region case split closed by `omega`; the cost is a
+  recurring `(Suffix.drop k s).remaining` vs `n − k` transparency mismatch.** The laws (`decode_spec`
+  `pure`/`byte`/`seq`, `decodeRepeat_spec`, `encode_of_decode`) turn on **three** transport shapes, all
+  `[propext, Quot.sound]`-only, and each is a *named lemma* you prove once:
+  - *`splice` associativity is a three-way re-parenthesization lemma, not a `simp`.*
+    `splice hm (splice hk s₁ s₂) s₃ = splice (Nat.le_trans hk hm) s₁ (cast … (concat s₂ s₃))`
+    (`splice_splice_assoc`) — the `BitVec`-free `concat_assoc` bundled with the `n − m` sub
+    arithmetic — closes only by *explicit* `cast_fin_symm` rewrites on **both** the outer and the
+    inner `splice` index casts, in the correct order (`rw [splice_apply]` for the outer two splices,
+    `unfold concat`, `rw [cast_fin_symm (e := splice_add hm)]` for each, `dsimp`, then the three-region
+    `by_cases`). The trap that eats a session: `simp [splice]` first produces `cast ⋯ (concat (cast ⋯
+    (concat s₁ s₂)) s₃)` whose inner `cast` is applied to a `concat` *value* (a `Bytes`-typed lambda),
+    and `cast_bytes_val'` will not fire because the index is not a bare `Fin` variable — hence
+    hand-steering with `splice_apply` (which keeps the index as `cast (congrArg Fin …).symm i`) is the
+    reliable route, not `simp`.
+  - *`cast` commutes past a `splice` prefix:* `cast (congrArg Bytes e) (splice hm s₁ s₂) =
+    splice (…) s₁ (cast … s₂)` (`splice_cast_commute`) is `subst e; simp`-trivial in the `e : n = n'
+    = rfl` case — but only if you `subst e` *first* (then both sides are literally `splice hm s₁ s₂`
+    up to proof-irrelevant `m ≤ n` witnesses); without the `subst`, `simp` stalls. This is the
+    one-line bridge for `Rel_seq` witnesses whose suffix length is `n − t₂.remaining` vs the encoder's
+    `(n−t₁)+(t₁−t₂)`.
+  - *Empty- and identity-suffix reconstruction:* `(Suffix.empty n).prepend (cast … s) = s`
+    (`prepend_empty_eq`) and `(Suffix.id n s).prepend (cast … emptyBytes) = s` (`prepend_id`) — both
+    are `Bytes.ext` + one `splice_apply` + `cast_fin_symm`, and the `n − 0`/`n − n` region is closed
+    by `Nat.sub_zero n`/`Nat.sub_self n` (a *named* `have`, not inline) so `omega` can fire.
+  - *The recurring blocker:* a `Suffix`'s accessor (`(Suffix.drop 1 s).remaining`, `(Suffix.id n s).remaining`)
+    does **not** reduce to `n − 1`/`n` under `rw`/`simp` unless you `dsimp [Suffix.drop]`/`unfold Suffix.id`
+    *in the right position* (before the `cast` whose `e` proof must unify). The `by omega` / `by simp`
+    *proofs* that `cast_fin_symm`/`cast_bytes_val*` emit are opaque, so a nested `↑⟨↑i, by omega⟩.val`
+    will not reduce — `fin_cases`-style `Fin.mk`/`.val` cancellations need the proof to be `rfl`-clean
+    (hence the named `have` for the arithmetic).
+  - *`Functional`/`unambiguous` converse laws over the length-indexed carrier compare `Sigma` pairs,*
+    and `encode_of_decode` closes by `hd x s s' hrels hrel' : ⟨n, s⟩ = ⟨n', s'⟩` (then `.symm`), with
+    `hrels : Rel d x s` recovered from the decode premise via `(bidir d x n s).2` — avoid `Sigma.mk.inj`
+    and its `HEq` (heterogeneous equality) fallout entirely; restate the witness so a plain `Rel d x s`
+    is available.
+
+- 2026-10-15 — **Re-derived `Rel`/`decode`/`encode` laws over a length-indexed `Bytes n := Fin n → UInt8`
+  carrier need a small set of *transport* lemmas, each `subst`- or `omega`-trivial, not new proof
+  techniques.** The concrete gaps hit this session (all `[propext, Quot.sound]`-only):
+  - *`Rel` is insensitive to a length cast — prove by `subst`, not induction.*
+    `Rel_cast {n m} (e : n = m) (s : Bytes n) : Rel d x (cast (congrArg Bytes e) s) ↔ Rel d x s`
+    closes by `subst m; rfl` (the cast reduces to `rfl` and `Rel` is definitionally the same
+    relation). Needed for `encode_rel`'s `seq` case, where `splice`'s suffix has type
+    `Bytes (n₁ + n₂ - n₁)` (not definitionally `Bytes n₂`) and `Rel_cast` reconciles it with the
+    inferred `Rel d₂ x₂ b₂`.
+  - *The suffix/prefix extraction of a `splice` is `bdrop_splice`/`prepend_eq_of_eq_splice`.*
+    `bdrop m (splice hm s₁ s₂) = s₂` closes by `unfold bdrop; rw [splice_apply]; unfold concat;
+    rw [cast_fin_symm]; by_cases (i.val + m < m) <;> omega/simp`. `prepend_eq_of_eq_splice`
+    (`s = splice hm s₁ s₂ → s = (Suffix.drop m s).prepend (cast … s₁)`) is the `decode_spec`
+    `seq`-completeness reassociation; the `s₁` needs a `Nat.sub_sub_self hm` length-cast because
+    `Suffix.prepend`'s prefix type is `Bytes (n - (n - m))`, not `Bytes m`.
+  - *`(k+1)-1` reduces but `(k+1)-k` does not* (`Nat.sub` recurses on its first argument, so a
+    bare `succ k` left of a variable `k` is stuck). Use `omega` for the `(k+1)-k = 1` cast proof
+    (`Nat.sub_sub_self`/`Nat.succ_sub_one`/`Nat.add_sub_cancel_left n₁ n₂` are the named forms);
+    the `Fin` single-byte index is `⟨0, Nat.zero_lt_succ k⟩`.
+  - *`induction d` on a `Codec`/AST whose `iso` constructor changes the value type `α → β`
+    generalizes the value `x` into the induction motive.* The IH then takes the value as an
+    *explicit* first argument: `ih a hs`, `ih₁ x₁ h₁`, `ih₂ x₂ h₂` (NOT `ih hs` — that gives
+    "expected α✝" because `x` is a generalized binder). This bites even the non-recursive-looking
+    `iso`/`alt` cases, not just genuinely type-changing nodes like `many`.
+  - *`⟨n, s⟩` dependent-pair (`Sigma`) notation is ambiguous in equality statements.* Comparing two
+    `⟨n, s⟩` terms (`have hs : ⟨0, emptyBytes⟩ = ⟨n, s⟩`) fails "Invalid ⟨⟩ notation: expected type
+    could not be determined" — annotate the RHS `(⟨n, s⟩ : Sigma fun k => Bytes k)` (or use
+    `Sigma.mk n s`). The `encode : … → Option (Sigma fun n => Bytes n)` result needs this in every
+    `encode_rel` case.
+  - *An `ast`-shaped bidirectional law's `seq`-forward case needs the split reassociation `prepend_assoc`
+    with a reconstruction hypothesis.* `(trans t₁ t₂).prepend (concat s₁ s₂) = t₁.prepend s₁` is
+    **false** without `h : t₂.prepend s₂ = t₁.bytes` (the two sides read `t₂.bytes` vs `t₁.bytes` in
+    the deep-suffix region); the `Rel`-`seq` witness also needs `cast_bytes_irrel` to commute two
+    different `Nat`-sub proofs of the same length equality (`splice_add hm` vs `sub_sub_add`).
+
 - 2026-10-15 — **The REAL cast-reduction trap with length-indexed carriers: the *inline*
   `show … by rw …; exact …` proof inside a `cast (congrArg F e)` is un-matchable — name it first.
   (Corrects the 2026-10-14 entry below, which misdiagnosed the cause as "opaque `omega` terms";
