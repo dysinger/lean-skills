@@ -460,6 +460,124 @@ names/paths); the specific repo lives elsewhere.
 
 ## Changelog
 
+- 2026-10-17 — **A length-indexed function (`Fin n → T`) is a scalar *read* substrate and a
+  nested-closure *bulk-write* substrate — do not claim "one pure carrier does both reads and
+  writes".** Profiling a `bytes n := Fin n → UInt8` carrier showed `decode`/scalar `s ⟨i,·⟩`
+  lowers to a single indexed load (the "scalar read" story is real and worth keeping), but a
+  *bulk* `encodeRepeat` over the same carrier builds one `concat` closure (5-arity, `Fin`-sum
+  dispatch + a `Nat`-add + 2 ctors) *per element*: linear but ~25× slower than an elided
+  contiguous `ByteArray`/`Array UInt8` accumulator over `@[extern]` primops, and ~2000× off
+  `memcpy`. A pure function cannot be a "flat accumulator" / "pre-sized buffer" — that wording
+  describes a mutable contiguous buffer (a *different* carrier). The fix is **not** a pure
+  re-staging (unreachable while keeping the denotation byte-identical) and **not** LLVM (the
+  `@[extern]` accumulator already hits the memory floor on plain clang): it is a **law-backed
+  fast path** — `fastEncode p xs = encode p xs` proved *pointwise* via the carrier's finitary
+  equality (`FunExt` over `Fin n`) + `Array.ofFn`/`GetElem` (the `Fin n → T ≃ Array T` bridge),
+  never `Array.extract`/`Array.toList` (which leak `Classical.choice` — the historical failure
+  of such fast paths). Keep the pure carrier as the *specification* for every law; add the
+  contiguous buffer only as a *proved-equal implementation*. (Generic; cf. §7 "carrier swap".)
+
+- 2026-10-17 — **`cases`/`subst` on a dependent `Sigma`-of-functions equality fails
+  ("Dependent elimination failed") — use `Sigma.mk.inj` to get `fst = fst' ∧ snd ≍ snd'`,
+  then `eq_of_heq`/`heq_of_eq`.** For `h : ⟨n, f⟩ = ⟨m, g⟩` where `f : Fin n → T` and
+  `g : Fin m → T` (a `Sigma` whose `snd` is a *function*, e.g. a length-indexed byte
+  string `Bytes n := Fin n → UInt8`), `cases h` and `subst h` both raise "Dependent
+  elimination failed … failed to solve equation `(fun x => …) = fun i => …`" — Lean cannot
+  decompose a function-valued dependent pair. The workable route is `Sigma.mk.inj h`,
+  which returns `conj (h₁ : n = m) (h₂ : f ≍ g)`; then `subst h₁` (or `eq_of_heq` when
+  the indices become `rfl`) turns the heterogeneous equality into a homogeneous one you
+  can `rw`. Only after the *indices* are definitionally equal can `heq_of_eq`/`eq_of_heq`
+  apply (they demand a single `Sort`); until then the `≍` is genuinely heterogeneous.
+
+- 2026-10-17 — **To fill `Sigma.ext h' (h'' : a ≍ b)`'s second argument across a length
+  cast, prove `a = cast (congrArg F h'.symm) b` and compose `(heq_of_eq that).trans
+  (cast_heq (congrArg F h'.symm) b)`.** `heq_of_eq : a = b → a ≍ b` needs `a`/`b` in one
+  type; when they differ only by a transport `h' : X = Y`, produce the homogeneous equality
+  `a = cast (congrArg Bytes h'.symm) b` (same type after the cast), then bridge back to the
+  *uncast* `≍` via `cast_heq` (`cast e x ≍ x`) + `HEq.trans`. This is the one reliable
+  recipe for a heterogeneous equality whose two sides are a length-indexed function; avoid
+  `Σ`-notation `.inj`/`▸` (the `▸`/`Eq.ndrec` notation demands an `=` LHS, not a `≍`).
+
+- 2026-10-17 — **`congr 1`/`simpa` and even `rw` can *loop* (maxRecDepth) on a `def` of
+  shape `fun i => if h : i.val < … then … else …` (a `Fin`-indexed `concat`); `set_option
+  maxRecDepth` and drive the two components with `rw` + `congrArg`/`congrArg single`.**
+  A pointwise `concat (single x) rest := fun i => if i.val < 1 then x else rest ⟨i.val-1, ·⟩`
+  is a term whose unfold `congr`/`simp` recurse into without making progress. For a goal
+  `concat (single a) xs = concat (single b) ys`, do `rw [h₁ : xs = ys]` then `congr 1` then
+  `exact congrArg single h₂`; for a `cast (congrArg Bytes h) (concat …)` transport, `rw
+  [concat_law]` (one step) instead of `simpa` which can re-enter the `concat` unfold.
+
+- 2026-10-17 — **`bs 0` (via `OfNat (Fin n)`) and `bs ⟨0, proof⟩` are *different* `Fin`
+  proofs, so a decoder's `if`-unfolded head byte won't unify with a `let b := bs ⟨0, p⟩`;
+  bind the head as `let b := bs 0` (the `OfNat` spelling) to match the decode's own
+  reduction.** When a structural decoder reads `bs ⟨0, Nat.pos_of_ne_zero h⟩` and a proof
+  then splits on `b.toNat`, the elaborator keeps `b` distinct from the decoder's inline
+  `bs 0` unless `b` is defined *as* `bs 0`. `dsimp [b]`/`simp [b]` unfold the `let` in the
+  goal but leave `hypotheses` mentioning `b` stale — so `simp [hov] at h` (where `hov : b …`)
+  "makes no progress". Define the head with the `OfNat` numeral and drop the explicit proof.
+
+- 2026-10-17 — **`simp [hov]` with `hov : ¬ (P ∧ Q)` does *not* reduce a dite
+  `if P ∧ Q then none else some …`; `by_cases` the disjunction, or let `simp [P<…]` alone
+  produce the `(P → ¬Q) ∧ R` conjunction and `rcases` it directly.** A hypothesis that is a
+  negation of a conjunction is not a rewrite for the positive conjunct; `simp [hov]` leaves
+  the `if` untouched (reports "no progress"). Either `by_cases hc : P ∧ Q` and get the
+  `some`/`none` branch explicitly, or observe that `simp [Hpos] at h` already normalizes
+  `some (…) = some (…) ∧ hov`-gated to `(P → ¬Q) ∧ (acc + v·mult = m) ∧ (k = 0) ∧ (rest ≍ …)`,
+  which you then `rcases ⟨_, hm, hk0, _⟩` (discarding the `P → ¬Q` conjunct).
+
+- 2026-10-16 — **`Classical.choice` leaks from `simp [defThatUnfoldsToAMatch]`, not from
+  `omega` or the *named* `def`-unfold lemmas — use `Rel_pure`/`Rel_empty` (iff lemmas), reject
+  bare `simp [Rel]`.** Chasing "why does `#print axioms F` report `Classical.choice`" over a
+  length-indexed carrier (`Bytes n := Fin n → UInt8`), the culprit was **not** the `cast`/
+  `omega`/`by_cases` machinery (all `[propext, Quot.sound]`), and **not** `set_option`-visible
+  `classical` — it was `simp [Rel]` in *base cases* (`empty`/`pure`), where `Rel` is an
+  `inductive`/`def` whose `empty`/`pure` constructors are terms in an arbitrary `Type α`:
+  unfolding `Rel` directly (rather than via its `Rel_empty : Rel (empty) x s ↔ False` /
+  `Rel_pure : Rel (pure x₀) x s ↔ x = x₀ ∧ n = 0` iff lemmas) makes `simp` intro a `Decidable`/
+  `of_decide`/`dite` path that pulls `Classical.choice`. The same base case proved with the
+  **named iff lemma** (`simp [decode, Rel_pure]`, then `constructor`) stays `[propext, Quot.sound]`.
+  Symmetrically `Nat.sub_lt_iff_lt_add` (used to turn `a - b < c` into `a < c + b`) is one of the
+  stdlib `Nat` lemmas that *does* carry `Classical.choice` — replace it with `omega`, which is
+  constructive. **Diagnostic workflow:** when `#print axioms Foo` shows `Classical.choice`,
+  bisect by `#print axioms` on each *named* lemma Foo calls (not on `Foo` itself — huge), and test
+  a minimal repro of each base case's `simp […]` (a `simp [decode, Rel]` in an `empty`/`pure`/
+  `byte` branch is the usual first suspect).
+- 2026-10-16 — **A structure-`ext` lemma with a `cast`-indexed second hypothesis must be
+  applied with explicit `t₁ :=`/`t₂ :=` — bare `apply Foo.ext` mis-infers the operands.** For a
+  `Suffix n`-style record with fields `remaining`/`hle`/`bytes : Bytes remaining`, the ext lemma
+  `Suffix.ext {t₁ t₂} (hrem : t₁.remaining = t₂.remaining) (hbytes : cast (congrArg Bytes hrem)
+  t₁.bytes = t₂.bytes) : t₁ = t₂` cannot be applied by `apply Suffix.ext` on a goal
+  `drop … = r`: Lean infers `t₁`/`t₂` the *wrong way round* (the two sides of the goal are both
+  `Suffix`-typed projections, so unification picks an arbitrary order), then the *first* subgoal
+  it emits is `hbytes` (not `hrem`), and every `·` bullet is off by one. Write
+  `refine Suffix.ext (t₁ := …) (t₂ := …) ?_ ?_` (named, in order). The `hbytes` proof itself is a
+  `cast e (cast e.symm x) = x` cancellation (`change` to name both casts, then `simp` / `subst e`).
+  The field-equality `hrem` direction matters: `Nat.sub_self n : n - n = 0` needs `.symm` when the
+  goal asks for `0 = n - (Suffix.id n s).remaining` (the `.remaining` projection is `n` only after
+  `dsimp [Suffix.id]`).
+- 2026-10-16 — **A `let`-bound carrier value is not unfolded by `rw`/`simp` — `dsimp [x]`
+  (zeta) it in position first, and `rw [List.mem_cons]` before `right` on a `::`-membership goal.**
+  With `let r' : Suffix (n - m) := Suffix.drop L (bdrop m s)`, a later goal `bdrop m s =
+  r'.prepend (cast … s₂)` will **not** match a lemma stated in terms of
+  `Suffix.drop L (bdrop m …)` until you `dsimp [r']` (reduces the `let`). In a `decr …` proof
+  where the recurrence is over a `Suffix`/`drop`, unfold the `let` *before* rewriting the outer
+  `s = r.prepend …` hypothesis, else the `.prepend`/`.trans` projections stay stuck. Also:
+  membership over a cons in the *goal* (`x ∈ b :: l`) must be normalized with
+  `rw [List.mem_cons]` **then** `right` — bare `right` on the raw `List.Mem` does not split the
+  `∨` (`right` only fires on the already-rewritten `Or`). And `List.mem_attach l a : a ∈ l.attach`
+  is a bare theorem (not an iff) — pass the *whole* Subtype, and fill the `∃ a, a ∈ l ∧ P a` (from
+  `List.mem_flatMap` in the *goal*) with a **three-slot** `refine ⟨a, List.mem_attach l a, ?_⟩`,
+  not `⟨a, ?_⟩`.
+- 2026-10-16 — **A list/`decodeRepeat` bidirectional law is proved by `Nat.strongRecOn` (not
+  `induction`), with the productivity witness discharging the `< n` guard, and the cons-case**
+  recursion mirrors the `seq`-case factorization. For `(xs, r) ∈ decodeRepeat p h n s ↔ ∃ s₀, …`
+  over a productive step (`h : ConsumesByte p`), the recursion is **well-founded on `n`**, so use
+  `Nat.strongRecOn n` with the motive carrying the whole `∀ xs s r` (introduce `xs`, then `revert
+  xs` so it sits under the `∀` the IH quantifies over), and the IH is applied at `t.remaining < n`
+  where that `<` comes **from `h x s t hmem₁`** (the productivity theorem), not from an unstated
+  `n - m < n`. The `(∃ a, a ∈ l ∧ P a)` back-direction (from `List.mem_flatMap`/`mem_map` in a goal)
+  is a **three-slot** `refine ⟨a, mem, ?_⟩` (the third is the `f a = b` map equation, closed by
+  `congrArg (fun y => (x :: rest, y)) htrans`).
 - 2026-10-16 — **A length-indexed `Bytes n := Fin n → UInt8` carrier needs a family of
   *cast-commutation* lemmas — each is a pointwise `Bytes.ext` + `splice_apply` + one
   `cast_fin_symm` rewrite, then a `n - …`-region case split closed by `omega`; the cost is a
