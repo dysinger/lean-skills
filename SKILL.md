@@ -458,6 +458,204 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-17 — **The boxing of a scalar-payload `Option` (`Option USize`/`Option UInt64`) in
+  hand-written `@[extern]` C is a *constructor with a scalar field*, not a small-int box — and
+  getting it wrong only *appears* to work, so value-check against the IR, never by reasoning.**
+  Returning `some (v : USize)` from a `@[extern]` symbol is **not** `lean_box(v.toNat+1)` (that is the
+  small-`Nat`/`Int` encoding) and **not** `lean_box_usize(v)` alone: the `Option` sum type is
+  `none = lean_box(0)` (tag 0) and `some v` = a **tag-1 constructor object holding one *scalar*
+  field** — allocate `lean_alloc_ctor(1, 1, 0)` (tag 1, `numObjs=0`, `scalarSize=1`) and set the field
+  with `lean_ctor_set(r, 0, lean_box_usize(v))`. A `lean_box_usize(v)` returned bare has tag 0 and is
+  read back as `none`; a `lean_box(v+1)` is a small-int box with the wrong scalar tag. The
+  generated-code reference is authoritative: in the emitted `.c`, `some (off + i)` on a `USize` compiles
+  to `lean_alloc_ctor(1,1,0); lean_ctor_set(_, 0, lean_box_usize(usize_add off i))`, and the *consumer*
+  reads it as `lean_ctor_get(x,0)` → `lean_unbox_usize(...)`. Grep `.lake/build/ir/*.c` for how the same
+  type is *constructed* in Lean's own output and mirror it exactly; a semantically-right `memchr` with a
+  wrong return-box ships garbage that only the byte-for-byte value check catches.
+
+- 2026-10-17 — **Generalize a suffix `byteSlice` seam into `blitBytes` (buffer-to-buffer `memcpy`) and
+  `findByte` (`memchr`); keep every seam `USize`-indexed and its Lean body the `Array` (not `ByteArray`)
+  spelling so the spec law is `rfl`.** A `blitBytes dst dstOff src srcOff len` body is the
+  `Array.extract`+`append` composition over `.data` (reducible; `blitBytes_spec` closes with **no axioms**
+  at all), while the `findByte` body is `Array.findIdx?` over `Array.extract` of the suffix re-offset by
+  `off` (`Array.findIdx?` returns a `Nat` relative to the extract, so add `off` to get the absolute `USize`;
+  `findByte_spec` is `[propext]` from the `==`/`Bool` reflection in the predicate). Both C symbols are a
+  single `memcpy`/`memchr`, clamps mirroring `Array.extract`'s truncation. The bench value-check compares
+  the C result against the Lean body byte-for-byte (constructed from the *same* `Array.extract`+`append`/
+  `findIdx?` expression), never a length check, and a mid-buffer window/sentinel (not the prefix/suffix
+  edge) is what actually catches a wrong offset/length/byte in the C.
+- 2026-10-17 — **"Make the shipped C fast, make the pure spec slow" is the honest end-state, and it
+  cuts the whole speed plan to two obligations.** When the *pure* `Bytes`/`List` interpreter is
+  accepted as a *specification* (the denotation every law is proved against) rather than the run
+  model, the perf question stops being "make the generic interpreter fast" — which is a dead end
+  (a pure immutable value can't be built by `memcpy`; unboxed `UInt8` + scalar `USize` cursor +
+  committed `|` choice are, respectively, trusted-only, proof-obstacle, and conditional-on-`Unambiguous`
+  inside a `[propext, Quot.sound]`/zero-`sorry` gate). The plan reduces to exactly two layers:
+  (a) **`@[extern]` C seams** (shape 2, elaborating body) for each irreducible raw-byte op — a
+  generalized `blitBytes` (superset of a suffix `byteSlice`), a `memchr`/`findByte` scanner, a
+  varint encode/decode-into-buffer, a `strtod`/numeric-parse, a zlib `deflate`/`inflate`; each is
+  ~20 lines of C + a reducible Lean `def` whose body is the *spec*, matching the already-shipped
+  `byteSlice` template; and (b) **per-format specialized decoders/encoders** (WAV header + one PCM
+  `memcpy`, protobuf varint/tag loop + length-delimited blit, PNG zlib seam) each proved *equal to
+  the generic spec once* by `decodeArray_eq`-style refinement lemmas. The key realization that
+  makes this sound: `@[extern]` only swaps the emitted C, so `#print axioms` sees the pure body
+  regardless — the fast C is *invisible to the gate*, and the only new proof work is law-level
+  (pure spec = pure seam body), never C-level. "No axiom" stays honest as "spec ≡ seam-body
+  proven; seam-C trusted, bench-value-checked."
+
+- 2026-10-17 — **An `@[extern]` trust seam with an elaborating body (shape 2) is *invisible to
+  Lean's reduction* — the trusted C is a runtime contract that can never appear in a law.
+  `@[extern "sym"]` swaps only the *emitted* C; the Lean `def` body still reduces under
+  `simp`/`rfl`, so `#print axioms f` reports the *body's* axioms (`[propext, Quot.sound]`-clean
+  or none) **regardless** of what the C does — no Lean proof can even see the C symbol. Two
+  consequences, both earned this session: (a) it is a **category error** to call a trust seam
+  "the single unproven step of a law"; there is no such proof step — the trust lives in prose
+  (F\*-vs-KaRaMeL posture: "declare the primitive, hand-write the C, name the seam"), orthogonal
+  to the axiom gate. (b) To *prove* `wrapper_spec` for a `wrapper b i := byteSlice b i`, you do
+  **not** need the seam at all — you unfold the body; the only real proof obligation is whatever
+  the *web* of `Nat`/`USize` indices forces (see next entry). Preserving this distinction is what
+  keeps "no axiom" from being misread as "no trust" and vice versa.
+
+- 2026-10-17 — **The `Nat ↔ USize` roundtrip is the platform-fact leak — give the extern-adjacent
+  wrapper a `USize` index, keep `Nat` *only* on the proof/spec side.** Refines the earlier
+  "keep the cursor on `Nat`" entry: split the decision in two. The *spec/cursor* stays `Nat` (as
+  before). But the *wrapper over an `@[extern]` whose C takes `USize`* must itself be
+  `USize`-indexed, or its refinement law inherits `(c.toUSize).toNat = c`, which needs
+  `c < 2^System.Platform.numBits` — the exact unproven platform fact the repo refuses.
+  Concretely: `f (b : ByteArray) (i : USize) : ByteArray := byteSlice b i` has `f b i =
+  ByteArray.mk (b.data.extract i.toNat b.data.size)` as an `rfl` (unfold `byteSlice`'s body;
+  `(ByteArray.mk a).data = a` and the `.size` coincidence are `rfl`); a `Nat`-indexed variant
+  would instead need `(i.toUSize).toNat = i`. The `Nat → USize` conversion is fine **at the call
+  site** (where the caller holds the `Nat` cursor and does `c.toUSize` once); it must not be
+  *baked into* the wrapper's own sigma/index, or it poisons every lemma built on it.
+
+- 2026-10-17 — **`USize` in an `@[extern]`'s *argument* lowers to an unboxed `size_t` scalar;
+  confirm it in the emitted IR, don't assert it.** `lean_byte_array_uset`'s C is
+  `..._uset(lean_obj_arg, size_t, uint8_t)` — i.e. a `USize` parameter compiles to a raw `size_t`
+  (`lean_unbox_usize` in the emitted wrapper), while `ByteArray` stays a borrowed `lean_object *`.
+  This is the one place the "`USize` is a scalar" claim is *actually* true (the carrier `Nat`
+  cursor is NOT — it boxes to bignum, per the task-3.1 IR finding). Verify by grepping
+  `.lake/build/ir/<Module>.c` for the symbol's declaration (`lean_object* sym(lean_object*, size_t)`)
+  and the call site (`lean_unbox_usize`), never by assertion.
+
+- 2026-10-17 — **How the genuine-suffix invariant actually closes (four exact tactics).**
+  (Resolves the previous entry — the blocker is now proved.) (a) Prove the invariant
+  **pointwise first** (`t.bytes i = s ⟨i.val + t.consumed, ·⟩` by induction on the description,
+  with a shared `i.val + t.consumed < n` bound lemma), then **lift** to the `Bytes`-level
+  `bdrop` form by `apply Bytes.ext; intro i; rw [cast_bytes_val' e …]` — the pointwise form
+  has a clean `seq` induction (nested consumed counts close by `omega` over `sub_sub_add`),
+  the `bdrop`/cast form does not. (b) **`subst e; simp` collapses "interpreter insensitive
+  to a length cast"** (`decode d (cast (congrArg Bytes e) s) = (decode d s).map …`): the cast
+  is along a `Nat` length equality, so `subst` reduces it to `rfl`; do **not** prove it by
+  induction (the membership-bound spelling thrashes). (c) **`List.map_inj_left` threads the
+  membership hypothesis** a pointwise-lemma needs: a `flatMap f l = flatMap g l` with the same
+  `l` becomes `congrArg (·.flatten) (List.map_inj_left.mpr (fun a ha => …))`, and `ha : a ∈ l`
+  is exactly the input a membership-parameterized lemma (`bdrop … = cast … t.bytes` for
+  `(x,t) ∈ decode d s`) requires — bare `congr 1; funext` *loses* `ha`. (d) **`rw [cast_cast]`
+  closes composed length casts** via proof irrelevance: after bridging `bdrop (i+(n-t)) =
+  bdrop t ∘ bdrop i` and `t.bytes = cast … (bdrop t s)`, the remaining `cast e₁ (cast e₂ X)`
+  equalities collapse by `rw [cast_cast]` (the `Nat` equality proofs are `Nat.eq_irrel`).
+
+- 2026-10-17 — **A `Suffix`-returning spec vs a cursor-returning fast path refinement is
+  blocked by `decode`'s own "genuine suffix" invariant, not by any general `Suffix` fact.**
+  To equate `decodeArray d a (consumed c)` with `decode d t.bytes` (where `t : Suffix n` came
+  from `decode d s`), the `seq` case needs `t.bytes = bdrop (n - t.remaining) s` — i.e. the
+  fact that `decode` *returns genuine suffixes of its input*, `∀ (x, t) ∈ decode d s,
+  t.bytes = bdrop (n - t.remaining) s` (proved by induction on the description `d`). The
+  tempting `bdrop c s = cast … t.bytes` equality is **false for an arbitrary `Suffix t`** — it
+  only holds because `t` was *produced by `decode`*. So a two-level refinement (spec returns
+  `Suffix`, fast path threads a consumed count) does **not** close by library-transport alone:
+  you first prove the spec function's *own* "suffix is a suffix" invariant, then compose the
+  transport lemmas (`bdrop (i+m) = bdrop m ∘ bdrop i`, the cast-insensitive `.remaining`, the
+  consumed-count transitivity). Discover the missing invariant and prove it before wiring the
+  `seq`/`bind` case — otherwise you thrash on an unprovable arbitrary-`t` lemma.
+
+- 2026-10-17 — **`List.foldl` over `ByteArray.push`/`Array.push` is proved via `.data`/
+  `Array` projection, not by `simp` (which *loops* on the recursion equation, and the `ByteArray`
+  ops are FFI-opaque).** `ByteArray.push`, `ByteArray.empty`, `ByteArray.mk` do not unfold, but
+  `(bs.push b).data = bs.data.push b` is `rfl`, and `ByteArray.ext : x.data = y.data → x = y`
+  reduces a `ByteArray` goal to an `Array` goal. The projection lemma
+  `(List.foldl (fun a b => a.push b) acc xs).data = List.foldl (fun a b => a.push b) acc.data xs`
+  is proved by induction + `bpush_data` (axiom-free); the `Array`-level
+  `List.foldl (fun a b => a.push b) acc xs = acc ++ xs.toArray` closes by `Array.ext'` +
+  `Array.toList_append`/`toList_push` + `List.append_assoc` (`[propext, Quot.sound]`-only). Use
+  `rw [List.foldl_cons, ih (acc.push b)]` (never `simp [foldlDef]`, which loops); `Array.toList_singleton`
+  does not exist — `#[b].toList = [b]` is `rfl`/`dsimp`.
+
+- 2026-10-17 — **An `Option`-returning refinement's `bind`/`map`/`orElse` skeleton bridges via a
+  "`none`-iff" derived from the `map`-equality, not by `rw` on the bare scrutinee.** Proving
+  `(f d x).map toList = (g d x).map ofFn` by induction, the `seq`/`alt` cases need to know
+  `f d x = none ↔ g d x = none`; derive it once as `map_none_iff (h : (f d x).map p = (g d x).map q)`
+  — `constructor <;> intro hne <;> cases the other option; rw [hne, the-other-cases-lem] at h;
+  simp only [Option.map] at h; cases h`. Then `cases ha : f d₁ x₁` and `rw [none_iff.mp/mpr ha]`
+  to line up the `bind`/`orElse` structure (use `Option.orElse.eq_def` only via `simp only
+  [Option.orElse]` — bare `rw [Option.orElse]` fails). In the `some`/`some` leaf, extract the
+  pointwise equalities with `Option.some.inj h` after `simp only [Option.map] at h`, and lift the
+  leaf (`ofFn_concat`, `Array.toList_append`) with `congrArg some`.
+
+- 2026-10-17 — **`Array.toList_ofFn`/`List.toArray_ofFn` round-trips leak `Classical.choice`;
+  the clean encode readback is the List-level form `(·.toList)` vs `List.ofFn ∘ snd`, and the
+  `Fin`-index head/`bdrop` reductions are `omega`- or `simp`-driven, not `rfl`.** `Array.ofFn` can't
+  appear on the refinement RHS (`Array.toList_ofFn` is `[Classical.choice]`); instead prove
+  `(encodeArray d x).map (fun a : Array UInt8 => a.toList) = (encode d x).map (fun e => List.ofFn e.2)`
+  with the `seq` leaf `Array.toList_append` + `ofFn_concat` (both `[propext, Quot.sound]`). For a
+  `byte`-style `bdrop i s ⟨0, h⟩ = s ⟨i, ·⟩` value equality, `unfold bdrop; congr 1; apply Fin.ext;
+  dsimp; omega` closes the `Fin`-proof-transparent goal (bare `rfl`/`congr` leaves `↑⟨↑⟨0, ⋯⟩+i, ⋯⟩`);
+  and a `consumedAbs`-style `.remaining` identity needs `dsimp only [Suffix.drop]` (not `unfold`,
+  which also breaks type-correct cast proof terms elsewhere in the goal) before `omega`.
+
+- 2026-10-17 — **`USize` is a *proof* obstacle even when it is the *right* runtime scalar:
+  its `+` is `Nat`-addition modulo `2^64` and its size is a platform fact — keep the spec/cursor
+  on `Nat`, and treat `USize` as an IR-inspection question, not a refinement invariant.**
+  `USize.toNat_add : (a + b).toNat = (a.toNat + b.toNat) % 2^64` and
+  `USize.size = 2^64` (which needs the unprovable `System.Platform.numBits = 64`) mean a
+  refinement law threading a `USize` cursor (`(x,c) ∈ f a i`) contracts the modulo into every
+  step: `c.toNat` of `i+1` is `(i.toNat+1) % 2^64`, not `i.toNat+1`, so no induction closes
+  `[propext, Quot.sound]`-only without an extra "the buffer is < 2^64" platform premise. The
+  clean split: **`Nat` is the proof/runtime carrier** (same choice a `pushBytesFrom`/bignum-fold
+  already makes); "does `USize` lower to `size_t`, no `lean_alloc`/box per node?" is answered
+  by *inspecting the emitted `.c`* (`size_t`, `lean_object *`), never by asserting it — if it
+  does not, record that and mark the "scalar index" premise false rather than forcing a `USize`
+  type that breaks the axiom gate. Decide the cursor's *type* before writing the refinement,
+  because it is a proof-budget decision, not a perf-tuning decision you can flip later.
+
+- 2026-10-17 — **RESOLVED the `ofFn`-bridge `Classical.choice` leak: the *plain* `Array`↔`List`
+  primitives are axiom-free; only the `ofFn`-*specialized* bridges leak.** Chasing a
+  `Fin n → T`-carrier fast-path refinement that refused to close `[propext, Quot.sound]`-only,
+  the clean/leaky split turned out to be sharper than "`List` clean, `Array` leaky": `Array.toList`,
+  `List.toArray`, `Array.push`, `Array.append`, `Array.foldl`, and `Array.getElem_toList` are **all
+  axiom-free** (`#print axioms` ⇒ none), and `List.append_toArray`/`Array.toList_append`/`Array.size_append`/
+  `Array.append_assoc` are `[propext, Quot.sound]`; the leak lives **only** in `Array.getElem_ofFn`,
+  `List.toArray_ofFn`, `Array.toList_ofFn`, and `List.getElem_ofFn`'s output (all `[Classical.choice]`).
+  So a readback `xs[i] = f ⟨i,·⟩` must route through `Array.getElem_toList` (axiom-free) + a hand-proved
+  clean `(List.ofFn f)[i] = f ⟨i, Nat.lt_of_lt_of_eq h List.length_ofFn⟩` (induct on `n`; `rfl` after the
+  `Fin.succ` `rfl`), and substitute the list-level equality `arr.toList = List.ofFn s` **before** any
+  `[i]` via `simpa only [h, List.length_ofFn]` — never `rw [h]` inside the `i < length` dependent motive.
+  Also: bare `simp`/`simpa` the *whole* way auto-fire classical lemmas; `simp only [hr, Option.map]` is
+  needed even in base `none`/`nil` cases of an `Option`-returning accumulator (unfold `Option.bind`/`Option.map`
+  explicitly so `none.bind`/`Option.map _ none` reduce).
+- 2026-10-17 — **`Classical.choice` in refinement proofs leaks from *specific* stdlib
+  `GetElem` round-trips and from bare `simp` (not `simp only`) — bisect with minimal
+  `#print axioms` repros, don't guess.** Proving `fastEncode p xs = encode p xs` over a
+  `Fin n → T` carrier, three *surprising* clean/leaky splits were pin-pointed: (1)
+  `(List.ofFn s)[i.val]` (a pure `List` read at a `Fin` index) is `[propext]`-clean, but
+  `(List.ofFn s).toArray.toList[i.val]` — the **same** term through a
+  `List.toArray`/`Array.toList` round-trip — leaks `[Classical.choice]` **even for the
+  trivial `x = x` `rfl`**. The `.toArray.toList` `[i.val]` re-enters the classical `GetElem`
+  instance during elaboration; `Fin.cast`/`Nat.lt_of_lt_of_eq` transport is *not* the culprit
+  (both are `[propext]`/no-axioms). (2) bare `simp [X]` auto-fires other `[simp]` lemmas
+  (classical ones included), while `simp only [X]` restricts to `X` — an
+  `@[extern]`/`ByteArray`-adjacent equality that leaked as `simp [Array.toList_append, …]`
+  closed `[propext, Quot.sound]`-clean as `simp only [Array.toList_append, …]`. (3)
+  `rw [htoList]` rewriting a `toList` equality *inside* a `[i.val]` access fails
+  "motive is not type correct" — the `GetElem`'s `i < length` bound is a dependent motive on
+  the rewritten length, so substitute the list equality *before* applying `[i.val]` (via
+  `funext`/`congrArg` on the list), never `rw` through the index. Also: `List.getElem_ofFn`
+  is `[propext]`-clean **as a theorem** but its *output* term carries a `by simp_all` index
+  proof that leaks `Classical.choice` when `rw`'d — prove your own clean variant
+  (`(List.ofFn f)[i] = f ⟨i, Nat.lt_of_lt_of_eq h List.length_ofFn⟩` by `induction n` +
+  `Fin.foldr_succ`/`getElem_cons_zero`/`getElem_cons_succ`).
+
 ## Changelog
 
 - 2026-10-17 — **A length-indexed function (`Fin n → T`) is a scalar *read* substrate and a
