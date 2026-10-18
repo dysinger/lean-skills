@@ -466,6 +466,31 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-18 — **A *block-structured* encoder/decoder (fixed `k`-element blocks + variable-width
+  padding tails, e.g. base32/64 with 5/3-byte blocks and 1/2/3/4-byte pad cases) cannot use plain
+  `List` structural induction — its `ih` is on the *immediate* cons tail while the block recursion
+  skips `k` elements. Use strong induction on the length: `Nat.strongRecOn bs.length (motive := fun n =>
+  ∀ ys, ys.length = n → …roundtrip ys…) (fun n ih ys hlen => …)`, giving `ih : ∀ m < n, motive m`; then after
+  `rw [decodeN_block b b₁ … bₖ₋₁ … rest]`, recurse with `ih rest.length hlen' rest rfl` where the length
+  shrink `hlen' : rest.length < n` is obtained by `rw [hlen] at (a have that rest.length < (cons…).length
+  proved with `simp only [List.length_cons]; omega`)** — `omega` alone cannot unfold `(x :: …).length`.**
+  The same shape mirrors at the `UInt8` surface: re-derive the strong induction there (don't transport it).
+- 2026-10-18 — **`unfold decodeN` on a block-equal goal unfolds the *RHS* recursive `decodeN` too,
+  leaving a non-definitional residual; the fix is a standalone equational lemma `decodeN_consK (c₀ … cₖ₋₁)
+  (rest) : decodeN (c₀ :: … :: cₖ₋₁ :: rest) = <the `if`/`match` body>` proved by `rfl`, and `rw
+  [decodeN_consK]` to reduce only the LHS `k`-cons scrutinee.**  (Base64 `k=4`, base32 `k=8`.)  The
+  `++` in `encodeN [b₀..bₖ₋₁] ++ encodeN rest` must first become a syntactic cons chain via `show … ++ …
+  = …` + `simp only [List.cons_append, List.nil_append]` (or `List.append_nil` for the `rest = []` whole-block
+  case) before `rw [decodeN_consK]` finds the scrutinee.
+- 2026-10-18 — **Order `rw` chains so each byte-extraction fact fires only after the vector it
+  reconstructs is fully reduced to its encode-form.** A 5-char-to-byte fact like `((vₐ%r)·s + v/q) % r'·… + … = b₃`
+  mentions `v₅`/`v₆` (the last two alphabet values), so you must `rw [valToX_valid v₅ h₅]`, `rw
+  [xToVal_valToX v₅ h₅]` (and the same for `v₆`) to turn them into their encode-form *before* `rw
+  [hb₃]`; otherwise `rw` reports "did not find an occurrence" because the target still spells those
+  sub-terms as the un-reduced alphabet values. Similarly, end each block lemma with a trailing `simp`
+  (or `decide`) — not `rfl` — because the decoder's `if` guards leave `decide False || …`/`¬True` `&&`
+  residue that `rfl` won't reduce but `simp`'s `Bool.not_true/false`/`Bool.false_and`/`decide_false` will.
+
 - 2026-10-18 — **`UInt8` is `%256`-truncating in *both* directions, and the clean `Nat`↔`UInt8`
   bridge is `UInt8.toNat_lt` (`n.toNat < 2^8`), `UInt8.ofNat_toNat` (`UInt8.ofNat x.toNat = x`),
   and `UInt8.toNat_ofNat'` (`(UInt8.ofNat n).toNat = n % 2^8`) — NOT `UInt8.toNat_ofNat`, which is
