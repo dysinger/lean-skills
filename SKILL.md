@@ -497,6 +497,24 @@ names/paths); the specific repo lives elsewhere.
   BE/LE/fixed-width/`varint`/`text`/tagged-`sum`/lookahead constructors to the core AST: those are
   *derived* compositions (`count k byte` + an endianness `iso`) living in downstream packages.
 
+- 2026-10-18 — **"every format is a `Codec α` value" breaks down for *variable-length* formats:
+  a finite `Codec` describes exactly one *fixed-shape* value, and the only `Codec (List α)`
+  producers are `count n p` (exactly `n`) and `manyUpTo n p` (at most `n`) — both *bounded*.**
+  There is no unbounded-`many` constructor (`Codec` = `iso | seq | alt | empty | pure | byte |
+  satisfy`), because `decode` is a **total function** `List (α × Suffix n)`, not the paper's
+  relation: a `many : Codec α → Codec (List α)` node is non-total for an empty-matching step
+  (`many (pure ())` on `[]`), so repetition was deliberately pushed out of the AST into the
+  `decodeRepeat`/`encodeRepeat`/`relRepeat` **triple** (each carrying a `ConsumesByte p`
+  productivity witness; `takeWhile p` is the worked example). Consequence: a *whole-list*
+  variable-length codec (`base16/base32/base64 : Codec (List UInt8)` over an arbitrary byte list)
+  **cannot be a single finite `Codec` value** — `count 2 (satisfy isHex)` ≫ pair-iso gives one
+  *byte*, not a list of them. The honest shapes are (a) a `Codec UInt8`/`Codec (List UInt8)` *leaf/block*
+  value + a whole-list triple at the repetition layer, or (b) adding an indexed `many`
+  constructor carrying `ConsumesByte p` — which means re-deriving every law over a
+  productivity-indexed AST (a core change, not a downstream-composition change). Don't
+  promise "`decode base64 == decode json == Codec.decode`" for the *whole-list* case until the
+  repetition layer can be a named value; for now only the *per-byte / per-block* leaf is a `Codec`.
+
 - 2026-10-18 — **Inject a Lake dependency into a Nix flake as a *local path* dependency so the
   sandboxed `lake build` never `git clone`s it: rewrite `require foo from git "…"` → `require foo from
   "./foo-src"` (path form resolves directly, no git/network) and `cp -r` the dependency source into the
