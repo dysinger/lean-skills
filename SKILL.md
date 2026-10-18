@@ -466,6 +466,23 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-18 — **Inject a Lake dependency into a Nix flake as a *local path* dependency so the
+  sandboxed `lake build` never `git clone`s it: rewrite `require foo from git "…"` → `require foo from
+  "./foo-src"` (path form resolves directly, no git/network) and `cp -r` the dependency source into the
+  build dir first — a flake input's `.outPath` is a *read-only* store snapshot, and Lake writes its `.lake`
+  into the package dir, so without the copy you hit `permission denied (error code: 13) … .lake`. The
+  dependency's own `lake-manifest.json` is gitignored (`No copy is made of local dependencies`), so Lake
+  builds the dep from source in place — no pre-built `.olean` needed. (`substituteInPlace` in the buildPhase
+  does the `require` rewrite; the source path is relative to the requiring package's dir.)
+- 2026-10-18 — **A *private* GitHub repo as a `github:` flake input is fetched *purely* by a token, never
+  `--impure`.** Anonymous fetch of a private `github:owner/repo` 404s (GitHub hides private repos from the
+  API/archive endpoints), while `git clone https://github.com/owner/repo` succeeds *only* via the macOS
+  `osxkeychain` credential helper — that success is a misdirection, not proof the repo is public. The correct
+  fix is `access-tokens = github.com=<token>` in `nix.conf` (or `nix --extra-access-tokens
+  "github.com=$(gh auth token)" …`): the shorthand fetches the private repo with no `--impure` and no
+  `path:` workaround. `git+https://…`/`git+ssh://…` are not the answer — the former still needs the keychain
+  (impure), the latter needs an SSH key that may not exist.
+
 - 2026-10-18 — **A *block-structured* encoder/decoder (fixed `k`-element blocks + variable-width
   padding tails, e.g. base32/64 with 5/3-byte blocks and 1/2/3/4-byte pad cases) cannot use plain
   `List` structural induction — its `ih` is on the *immediate* cons tail while the block recursion
