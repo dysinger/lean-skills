@@ -28,6 +28,7 @@ skill does not cover.
 | `ByteArray` proofs won't reduce / `simp` stalls on a primitive | [§2 Proving over primitives](#2-proving-over-primitives) |
 | A `partial def`/recursive combinator won't typecheck | [§3 `partial`, coinduction, nonempty](#3-partial-coinduction-nonempty) |
 | Notation collision with a reserved token (`\|`, `*`, `$`, `open`) | [§4 Notation & keyword collisions](#4-notation--keyword-collisions) |
+| How do I make a parser/codec *fast*; why is it ~20-40x off C? | [§7 Work faster (carrier swap > FFI > compiler)](#7-work-faster-carrier-swap--ffi--compiler-and-lean-on-usize) — and the 2026-10-18 "boxed scalar ceiling" entry in the Append |
 
 ---
 
@@ -430,12 +431,19 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
    buffer) instead of `… → List (α × Nat)`, and prove it equal to the `List`
    spec by the same refinement lemma you already write for the carrier swap.
    This removes the allocation that dominates the profile.
-2. **Scalar indices.** `USize` (and `UInt64`/`UInt8`/…) **is** a scalar in Lean's
-   IR; bignum `Nat` is an `lean_object *`. A function indexed by `USize` already
-   codegens to a `size_t`/`ulong` loop under the *existing* `EmitC` — near-C with
-   no representation fiction. This is the decisive fact the "erase `Nat → size_t`"
-   compiler plan misses: you get unboxed indices by *typing them `USize` in source*,
-   not by asking a backend to erase a bignum.
+2. **Scalar indices — with the field-position caveat.** `USize` is a scalar in
+   Lean's IR *only* in argument/return position of an `@[extern]`; bignum `Nat` is
+   always an `lean_object *`, and `UInt64`/`UInt32` arithmetic is **also** boxed
+   (`instAddUInt64` → `lean_object*`, no `uint64_t` in the emitted C — see the
+   2026-10-18 entry). A function *indexed* by `USize` codegens the *index* to
+   `size_t`, and so do `ByteArray.uget`/`uset` (→ `lean_byte_array_uget(..., size_t,
+   uint8_t)`). **But** the moment that `USize` is *returned/stored* in a
+   `Prod`/`Option` field it re-boxes (`lean_box_usize`), and `USize.toNat` at each
+   boundary adds a bignum conversion — so a result-returning interpreter (`Option
+   (α × USize)`) does **not** stay unboxed end-to-end. Rewriting a parser to thread
+   a `USize` cursor made it *slower* for exactly this reason. **Net:** `USize`
+   helps the *index-argument* and the *bit-vector ops in C seams*, not the *pure-Lean
+   scalar computation*, which remains boxed regardless of which word type you write.
 3. **`@[extern]` FFI** only *if* a stdlib primitive already exists to shim — and
    verify it actually adds anything; stdlib `ByteArray.get`/`size`/`push`/
    `copySlice` are already `@[extern]` C, so a hand-written wrapper over them is a
@@ -457,6 +465,146 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
+
+- 2026-10-18 — **`UInt8` is `%256`-truncating in *both* directions, and the clean `Nat`↔`UInt8`
+  bridge is `UInt8.toNat_lt` (`n.toNat < 2^8`), `UInt8.ofNat_toNat` (`UInt8.ofNat x.toNat = x`),
+  and `UInt8.toNat_ofNat'` (`(UInt8.ofNat n).toNat = n % 2^8`) — NOT `UInt8.toNat_ofNat`, which is
+  only for the `OfNat.ofNat` spelling.**  When a byte-level codec's alphabet is ASCII `< 256`, make
+  the truncation vanish explicitly with `Nat.mod_eq_of_lt` (`rw [UInt8.toNat_ofNat', Nat.mod_eq_of_lt h]`
+  where `h : c < 256`), so the `% 256` never leaks into the arithmetic goals.  `UInt8.ofNat` unfolds to
+  `{ toBitVec := BitVec.ofNat 8 n }`, not `OfNat.ofNat n`, which is why the `'`-primed lemma is the one
+  that matches a `def toByte n := UInt8.ofNat n` surface.
+- 2026-10-18 — **`omega` does NOT expand `if`/`ite` branches, and a stdlib-only project (no mathlib)
+  has no `norm_num`/`nlinarith`/`ring`/`fin_cases`/`interval_cases` — so finite-alphabet bijections and
+  closed-range arithmetic must be proved by `by_cases` on each range + `simp only […, ite_true,
+  ite_false]` + `omega`, never by letting `omega`/`simp` reduce a nested `if` chain on its own.**
+  Three concrete patterns for a `valToX`/`xToVal` bijection over a 4-range alphabet: (a) per-range
+  `by_cases` with the char as a single arithmetic expression (`65 + i`, `71 + i` instead of `97 + i - 26`),
+  then `simp only [h, ite_true, ite_false]` + `omega`; (b) a "never the sentinel" fact (`isPad (valToX i)
+  = false`) closes with `exact decide_eq_false_iff_not.mpr (by omega)` after the same `by_cases` (the
+  `Bool`/`decide` goal is a Prop-negation in disguise); (c) a final finite tail (`i = k ∨ i = k+1` from
+  `¬ i ≤ k-1` and `i ≤ 63`) closes with `rcases (show i = k ∨ i = k+1 by omega) with rfl | rfl <;> decide`.
+  `decide` is `[propext, Quot.sound]`-safe on closed `Decidable` goals; `native_decide` is NOT (it leaks
+  `Lean.ofReduceBool`).
+- 2026-10-18 — **A power-of-two bit/quartet-sum identity (`Σ (v / 2^k % r) * 2^k = v` for `v < 256`)
+  is `omega`-provable — but only after `simp only [Nat.reducePow, Nat.reduceSub]` turns the symbolic
+  `2^(7-i)` into a concrete `128`/`64`/…**  With `bitAt v i := (v / 2^(7-i)) % 2`, `omega` alone leaves
+  `2^(7-i)` as exponentiation and fails; `simp only [Nat.reducePow, Nat.reduceSub]` (evaluating `2^(7-0)`,
+  `2^(7-1)`, … to literals) then `omega` closes it.  The bound `v < 256` is load-bearing (makes each
+  `v/2^k % 2` the actual bit); `omega` needs it stated via `have : v < 256 := …`/`UInt8.toNat_lt`.
+  Same pattern for radix-4 (`(v / 4^(3-i)) % 4`).
+- 2026-10-18 — **A `roundtrip` proved over a `Nat`-level core (`encodeN`/`decodeN : List Nat → …`)
+  lifts to a `UInt8` surface by *re-deriving* the induction with `toNat`/`ofNat` transparency at each
+  step, not by a separate transport lemma — and `simp [encode, decode]` on the `UInt8` surface
+  over-splits the decoder's `&&`/`if` into `true = true ∧ …` residue that obscures the `rw` target.**
+  Write the `UInt8` decoder with a single `if cond₁ && cond₂ then …` (not nested `if cond₁ then if cond₂`),
+  and drive the roundtrip with `rw`-chains (`toByte_valTo*`, `valTo*_valid`, `*ToVal_valTo*`, the digit-sum
+  equality) rather than a big `simp`, finishing with one `omega`/`simp` on the reduced arithmetic.
+  is proved cleanly via the *pointwise* genuine-suffix invariant (`decode_genuine_suffix_pointwise`),
+  not the `bdrop`-form: read each side at one `Fin` index, unpack one `bdrop`, `congr 1; apply Fin.ext;
+  dsimp; omega`, with `t.consumed = n - t.remaining` making equal `remaining` give equal `consumed`.**
+  The tempting `bdrop_consumedAbs_eq` route instead rewrites the consumed count into a lemma whose
+  *other* hypothesis (`consumedAbs_remaining`-style, `a.size - consumedAbs = remaining`) is *dependent*
+  on that count — `rw [hc] at E` then fails "motive is not type correct" because the count appears both
+  in the `bdrop` index and inside the `congrArg Bytes` of the cast. Avoid rewriting a `Nat` into a term
+  that mentions a dependent-equality hypothesis over that same `Nat`; reach for the pointwise invariant and
+  close the one remaining `Fin`-index equality (a proof-irrelevance + `omega` step) instead.
+- 2026-10-18 — **To turn "`t.prepend s₀₁ = t.prepend s₀₂`" into `s₀₁ = s₀₂` (injectivity of a
+  length-indexed `splice`/`prepend` in its *prefix*), state and use three lemmas, not `simp`:**
+  `splice_prefix_read (hm : m ≤ n) (s₁ : Bytes m) (s₂ : Bytes (n-m)) (i : Fin n) (hi : i.val < m) :
+  splice hm s₁ s₂ i = s₁ ⟨i.val, hi⟩` (unfold `splice_apply` → `concat` → `rw [cast_fin_symm (e := splice_add hm)]`
+  → `dsimp` → `simp [hi]`); `prepend_prefix_read` (the same at `Suffix.prepend`, the prefix is `s₀` and `hi :
+  i.val < n - t.remaining`); and `prepend_prefix_eq t s₀₁ s₀₂ : t.prepend s₀₁ = t.prepend s₀₂ → s₀₁ = s₀₂`
+  (apply `Bytes.ext; intro i`, `congrFun` the equality at `⟨i.val, Nat.lt_of_lt_of_le i.isLt (Nat.sub_le n t.remaining)⟩`,
+  then two `rw [prepend_prefix_read … i.isLt]`). The *same-type* `prepend_prefix_eq` is the cast-free half:
+  first prove `t₁ = t₂` (via `Suffix.ext` + the pointwise invariant) so `subst t₁` makes `s₀₁`/`s₀₂` share one
+  type, then this lemma closes with no cross-length cast.
+- 2026-10-18 — **An `@[extern]` trust seam whose Lean body is an `Array.extract`+`append` *composition*
+  is NOT a window replacement on out-of-range inputs: `extract 0 off ++ src.extract s (s+len) ++
+  dst.extract (off+len) n` yields *variable-length* results (appends `src` past `n` when `off > n`, drops
+  bytes when `src` is short), while the C `memcpy`-into-full-`dst` returns exactly `n` bytes.** The two match
+  only in-range; the body and the C drifted silently because the bench value-check exercised only mid-buffer
+  inputs. Fix the *body* to the clamped full-`dst` semantics (`dc := min off n`, `sc := min srcOff slen`,
+  `lc := min len (min (n-dc) (slen-sc))`, result `dst[0,dc) ++ src[sc,sc+lc) ++ dst[dc+lc,n)`), which is `rfl`-spec-able
+  *and* matches a single-`memcpy` C; make the C's clamps **overflow-stable** (`copyLen > n - dstOff`, not
+  `dstOff + copyLen > n`, since the Lean `Nat` never wraps but `size_t` can). Always add an out-of-range
+  boundary value-check (empty source, `off` at/past end, `len` past end, `len = 0`) — it is the only check that
+  catches a wrong clamp; a mid-buffer lane cannot.
+- 2026-10-18 — **Proving a monotonicity/bound law for a definition is *not* interchangeable with the
+  "never overruns" bound you might want: an unconditional `decodeArray … → i ≤ c` (cursor never moves
+  backward) is provable, but `c ≤ a.size` needs a `i ≤ a.size` precondition, because `pure x` returns
+  `(x, i)` for *any* `i` (a cursor already past the end is a legal result).** Before "fixing" a docstring that
+  overclaims a bound, check the *base constructors* (`pure`/`empty`) for the counterexample; the honest fix is
+  either to reword to the proved fact or to state the bound *with* the precondition and document why it is
+  load-bearing (it is not a style choice — the unconditional form is false).
+
+- 2026-10-18 — **Pure-Lean *parsing* (not just bulk codecs) has a hard ~20-40x-off-C ceiling,
+  and it is a *toolchain* limit, not a code-quality one: `Nat`/`UInt8`/`UInt64` all box, and
+  `USize` only unboxes as an `@[extern]` *argument*, never as a `Prod`/`Option` *field*.**
+  Chasing a "very fast" RFC 3339 timestamp parser, three independent confirmations: (a) IR shows
+  `acc*10+digit` lowers to `lean_nat_mul`/`lean_nat_add`/`lean_nat_sub` (bignum `lean_object*` calls) and
+  byte loads to `lean_uint8_to_nat`; (b) a pure-Lean `sum64` `while` loop over `UInt64` lowers to
+  `instAddUInt64`/`instMulUInt64`/`instLTUInt64` (boxed `lean_object*`) with **no** `uint64_t` anywhere;
+  (c) rewriting the parser to a `USize` cursor made it *slower* (~206→~440 ns) because `baGetU`'s
+  `off.toNat < a.size` does a `USize→Nat` bignum conversion + `get_elem_tactic` proof per read and the
+  `USize` field re-boxes (`lean_box_usize`). There is **no** pure-Lean escape: `@[implemented_by]`/
+  `@[csimp]` still emit through the same boxed LCNF→EmitC pipeline; `native_decide`/`bv_decide` are
+  `Prop`-reflection, not runtime `Nat` arithmetic. **Corrects §7 point 2** — "type it `USize` in source
+  and get unboxed indices" is true only for an `@[extern]` *argument*, false once the value is *returned*
+  in a product/option; a result-returning interpreter cannot stay unboxed this way. The honest end-state:
+  pure-Lean codecs (~20-40x C) are the *spec*; the only C-speed regions are the generic bulk `memcpy`/
+  `memchr` seams, and real speed (TLS crypto etc.) is FFI'd, not Lean. Do not chase further pure-Lean
+  parsing micro-optimizations hoping to close this gap — it is the compiler backend's boxed scalar,
+  not the code shape.
+- 2026-10-18 — **Benchmark numbers here are noisy by ±2x with machine load/thermal; cross-check
+  against a `calib memcpy`/`memchr` baseline before believing any single `[measured]` figure, and do
+  not micro-optimize against an unstable baseline.** A `calib memcpy` lane measured 66↔300 ns across
+  runs on the *same* binary (load average ~2.4), and a committed "302→206 ns improvement" was later
+  revealed to be largely that noise (the reverted code re-measured 412 ns). Corollaries: (1) take the
+  *best-of-N* or check `uptime`/load before comparing two versions; (2) a "regression" vs "win" verdict
+  needs the noisy baseline measured in the *same* window, not recalled from an earlier session; (3) record
+  the baseline value *in the result line*, never report a bare ns/op that the reader can't sanity-check.
+- 2026-10-18 — **A `ByteArray`-vs-C comparison against a semantic parser must be apples-to-apples;
+  C `strptime`/`date`-style parsing is ~10 ns/op on a 23-byte record, vs ~200-400 ns for the boxed
+  pure-Lean equivalent.** When someone asks "can Lean parse as fast as C", the concrete answer is a
+  head-to-head: a hand-written `clang -O2` RFC 3339 parser (uint32 registers, no alloc) is ~10 ns/op,
+  and no pure-Lean reshaping gets under ~20x that because the per-digit `acc*10+d` is bignum-boxed.
+  The honest framing is a *ratio to the same-machine C baseline*, not an absolute MiB/s number.
+- 2026-10-17 — **A `Prod Nat USize` in `@[extern]` C is `lean_alloc_ctor(0, 2, 0)` with two
+  *object* fields — `Nat` via `lean_usize_to_nat`, `USize` via `lean_box_usize`; both box as
+  objects (a `USize` is NOT a raw scalar once it is a field, only as an argument).** Returning
+  `some (n : Nat, k : USize)` (the result of a varint/decimal seam): build the pair with
+  `lean_alloc_ctor(0, 2, 0)`, `lean_ctor_set(pair, 0, lean_usize_to_nat(n))` (small-`Nat`
+  immediate; `lean_unbox` on a bignum/mpz would be wrong, so document small-`Nat`-only), then
+  `lean_ctor_set(pair, 1, lean_box_usize(k))`, then wrap in `some`'s tag-1 ctor
+  `lean_alloc_ctor(1, 1, 0); lean_ctor_set(opt, 0, pair)`. The authoritative reference is the
+  way the *Lean-generated* C constructs the same type (in `.lake/build/ir/*.c`): the generator's
+  `Prod`-of-`Nat`-and-`USize` is `lean_alloc_ctor(0,2,0)` with the `Nat` as `lean_usize_to_nat(…)`,
+  not the `lean_alloc_ctor(0,1,sizeof(size_t))`+`lean_ctor_set_usize` you might guess from the
+  scalar-argument lowering. (Generalizes the earlier `Option USize` entry: every *field* whose
+  runtime rep is an unboxed scalar is still re-boxed via `lean_box_*` when stored in a constructor.)
+- 2026-10-17 — **`String` is a `Classical.choice`-leaky substrate for a proof gate: every
+  accessor (`String.toList`, `.data`, `.get`, `.length`, `toNat?`) is `@[extern]` UTF-8-backed and
+  leaks `Classical.choice`; a clean parser/reference over text must take raw `ByteArray`/`Array
+  UInt8` instead.** `#print axioms String.toList`/`String.data`/`String.get`/`String.length` all
+  report `[propext, Classical.choice, Quot.sound]`, so a `String`-typed seam's Lean body (a spec
+  pinned to `[propext, Quot.sound]`-only) cannot use any of them. `Array.get`/`Array.extract`/
+  `ByteArray.mk`/`ByteArray.data`/`UInt8.toNat`/`Char.toNat` are axiom-clean (`[propext,
+  Quot.sound]`-only), so write the reference over bytes (e.g. an ASCII-decimal scanner folding
+  `acc · 10 + (b.toNat - 48)`). `Char.isDigit`/`Char.ofNat` are also clean, but a `List Char` from
+  `String.toList`/`.data` is not. Rule: text-processing seams that must stay in the axiom-clean
+  gate take `ByteArray`, never `String`.
+- 2026-10-17 — **A "committed" structural decoder (`Option`-threading `orElse` on `Alternative`,
+  first-branch `bind` on `seq`) is NOT `= (backtracking decoder).head?` in general — the `seq`
+  commitment is strictly stronger than "first result".** If `d₁`'s first result is a dead end for
+  `d₂` (its `bind` yields `none`) but a *later* `d₁` result succeeds, the committed `decodeOne (seq …)`
+  returns `none` while `(decodeArray (seq …)).head?` skips the dead-end and returns the later
+  result's pair. So the "committed result = first backtracking result" identity holds only for the
+  `alt` node, not `seq`; the honest uncontradictable facts are (a) **soundness** — every committed
+  result is a member of the backtracking list (provable by induction, `[propext, Quot.sound]`), and
+  (b) the **gated** completeness — pair-level uniqueness (value+count) makes the committed decoder
+  equal to the (unique) backtracking result. Do not assert the naive `head?`-equality; it is false,
+  and the gate that makes the fast path sound is "backtracking result is unique", not "commit = first".
 
 - 2026-10-17 — **The boxing of a scalar-payload `Option` (`Option USize`/`Option UInt64`) in
   hand-written `@[extern]` C is a *constructor with a scalar field*, not a small-int box — and
