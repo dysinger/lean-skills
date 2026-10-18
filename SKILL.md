@@ -466,6 +466,20 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-18 — **The extensibility primitive of a byte-substrate codec (an inductive `Codec α` over
+  `Bytes n := Fin n → UInt8`) is `satisfy : (UInt8 → Bool) → Codec UInt8` (the byte-token-with-guard),
+  and variable-length / multibyte / self-delimiting tokens are a *run* over it (`takeWhile p` = the
+  maximal prefix with `p b`), not a lookahead or per-byte-dispatch constructor.** A single-byte
+  `satisfy` cannot recognize a varint (LEB128: consume until the high bit clears) or a UTF-8 symbol
+  (1–4 contextual bytes) — and it must not try: the run (`many (satisfy p)` / `decRepeat`/
+  `encodeRepeat` over `satisfy`) plus a downstream `iso` that folds the run's bytes is what decodes a
+  varint (`takeWhile highBitSet` + fold 7-bit groups), a UTF-8 code unit, a base-N alphabet, or a JSON
+  string body. Keep the description AST *closed and dumb* (`byte`, `satisfy`, and the combinators `seq`/
+  `alt`/`count`/`iso`); express every concrete format as a `Codec α` value so `decode base64` and
+  `decode json` are literally the same `Codec.decode` call — only the codec changes. Do NOT add
+  BE/LE/fixed-width/`varint`/`text`/tagged-`sum`/lookahead constructors to the core AST: those are
+  *derived* compositions (`count k byte` + an endianness `iso`) living in downstream packages.
+
 - 2026-10-18 — **Inject a Lake dependency into a Nix flake as a *local path* dependency so the
   sandboxed `lake build` never `git clone`s it: rewrite `require foo from git "…"` → `require foo from
   "./foo-src"` (path form resolves directly, no git/network) and `cp -r` the dependency source into the
