@@ -466,6 +466,23 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-18 — **Adding a predicate-guarded byte token (`satisfy : (A → Bool) → Codec A`, decoding
+  "first element iff `p` it") to an inductive AST that is exhaustively `match d`ed in `Rel`/`decode`/
+  `decodeFast`/`encode` (and every packed/committed mirror) means *every* match gains a case, and the
+  `satisfy` proofs mirror `byte` with one extra conjunct.** Two gotchas: (1) the `¬p` decode branch
+  (`by_cases hp : p (s ⟨0, ·⟩)` ) reduces `decode (satisfy p) s` to `[]`, so the `decode_spec`-style
+  bidirectional law must prove `¬ Rel (satisfy p) x s₀` by contradiction — `Rel` in the `satisfy` case is
+  `p x = true ∧ ∃ h : n = 1, h ▸ s₀ = single x`; extract `p x = true`, then reconstruct `x = s ⟨0, hnpos⟩`
+  from the prefix `s = r.prepend s₀` via `prepend_prefix_read r s₀ ⟨0, hnpos⟩ hlt` (not `rw [hs] at hb`,
+  which fails because the goal is a *subexpression* equality, not a whole-buffer occurrence), and close with
+  `exact False.elim (hp hpx')` — `exact hp hpx` fails when the residual goal is still a membership `(x,r)∈[]`,
+  not a bare `False`. (2) when an earlier `rw [decode]` already unfolded the scrutinee in the goal, a later
+  `rw [decode]`/`rw [hdec]` does **not** match; instead `have hdec : decode … = [] := by simp [decode, hn, hp]`
+  as a *separate* goal, then `rw [hdec]` — the `decode` in `hdec`'s proof is a fresh definition, the one in the
+  goal is already unfolded. (3) for the `p x = true` forward half and the packed/`decodeArray`/`decodeOne`
+  refinement, the predicate on the first byte is `p a[0 + i]` after `bdrop i (·) ⟨0, ·⟩` unfolds — `simpa`
+  bridges `p a[i]` (the packed decoder's spelling) to `p a[0 + i]` (the spec `bdrop` spelling).
+
 - 2026-10-18 — **The extensibility primitive of a byte-substrate codec (an inductive `Codec α` over
   `Bytes n := Fin n → UInt8`) is `satisfy : (UInt8 → Bool) → Codec UInt8` (the byte-token-with-guard),
   and variable-length / multibyte / self-delimiting tokens are a *run* over it (`takeWhile p` = the
