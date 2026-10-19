@@ -466,6 +466,52 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-19 — **A recursive inductive AST (`Codec α`) *cannot* carry a constructor whose field is a
+  *semantic* predicate over that same AST's own denotation** — `many : (p : Codec α) → Productive p →
+  Codec (List α)` with `Productive p := ∀ x n s, Rel p x s → n ≠ 0` forms the definition-order cycle
+  `Codec.many → Productive → Rel → Codec`, and Lean rejects both escapes: (a) a mixed `mutual` block
+  (`inductive Codec` + `def Rel` + `def Productive`) is illegal — *"invalid mutual block: either all …
+  inductive/structure … or all … definitions"*; (b) `mutual inductive Codec + Rel` is illegal on
+  *universe* — *"resulting type `Prop` differs from `Type 1`"* — and this is irreparable, because
+  `Rel : … → Prop` is pinned at `Sort 0` (`Prop`) while `Codec : Type → Type 1` is pinned at `Sort 1`.
+  Consequence: **unbounded `many` must stay a *derived* combinator outside the AST** (its denotation is
+  the least-fixpoint `relRepeat`/`decodeRepeat`/`encodeRepeat` triple, each carrying `ConsumesByte p`),
+  never a `Codec` constructor — do not propose adding `many` (or any other than `byte`/`satisfy`) to a
+  byte-substrate `Codec` and do not budget for converting every `induction d` law to `Codec.rec`.
+
+- 2026-10-19 — **The paper's `many` (Rendel–Ostermann §3.4) is a *derived* combinator
+  `many p = nil $ pure () | cons $ p ∗ many p`, and the F* reference has *no* `many` combinator at all —
+  its unbounded-run primitive is `satisfy_many0`/`satisfy_many1` (aliases `many0`/`many1`), a
+  `let rec satisfy_run_scan f bs` that scans a maximal leading run of the *finite* input byte list, one
+  byte per step; no `Productive`/`ConsumesByte` witness is needed because the recursion is over the finite
+  input, not over an arbitrary `p`'s denotation.**  So a byte-substrate codec's *variable-width run* is
+  `takeWhile p := many (satisfy p)` realized over the productive repetition triple — exactly the landed
+  `relTakeWhile`/`decodeTakeWhile`/`encodeTakeWhile` — and fixed-width base-N blocks are `count k (satisfy
+  p)` + a grouping `iso`.  This is the authoritative resolution when someone asks "add `many` to the AST".
+
+- 2026-10-19 — **`simp [F, hv] at hdec` *consumes* `hv`** — if `hv : (P && Q && R) = true` is a `simp`
+  argument while simplifying `hdec`, the rewrite unfolds `hv`'s `&&` chain and leaves `hv : True`, so a
+  later `have hi : P = true := by simp [hv] at *; assumption` fails.  Extract each conjunct **first**
+  (`have hP : P = true := …; simp [Bool.and_eq_true] at hv; exact hv.1`, then `.2` for the rest), **before**
+  the `simp` that *uses* `hv` as a rewrite.  Same failure mode for `by_cases hv : cond` followed by
+  `simp [body, hv] at h`: the `by_cases`-introduced `hv` is the very hypothesis `simp` rewrites away.
+
+- 2026-10-19 — **A partial-`Iso`'s `law` for a fixed-`k` digit↔byte grouping needs *two* directions the
+  forward-only `roundtrip` never stated: the converse bijection `valToX (xToVal e) = e` for *valid* `e`,
+  and a digit-decomposition *uniqueness* lemma** (`d0·64+d1·8+d2 = b`, each `di ≤ 7`, ⇒ `di = b/…`) —
+  proved with plain `omega` once the per-digit bounds are in scope (integers `di ∈ [0,7]` force
+  `b % 8`, `(b / 8) % 8`, `b / 64`), but only after `omega` is given the bounds as separate `have`s; the
+  nested `%`/`/` in `(b / 8) % 8 * 8 + b % 8 = b` needs `Nat.div_add_mod b 8` and `Nat.div_add_mod (b / 8) 8`
+  as hypotheses — `omega` alone does not unfold `(b/8) % 8`.
+
+- 2026-10-19 — **`UInt8.toNat_inj` is an `iff` (`a.toNat = b.toNat ↔ a = b`), not a function — `apply
+  UInt8.toNat_inj` fails "function expected" — and `UInt8.ofNat_toNat` is a *closed* proposition
+  (`UInt8.ofNat x.toNat = x`) that `exact UInt8.ofNat_toNat c` also rejects ("function expected … applied
+  to c").**  To lift `toByte n = b` (`toByte n := UInt8.ofNat n`) to `n = b.toNat`, use
+  `have hb' := congrArg UInt8.toNat hb; simpa [toByte, UInt8.toNat_ofNat', Nat.mod_eq_of_lt hlt] using hb'`
+  with `hlt : n < 256`; to close `toByte x.toNat = x` use `by simp [toByte]` (which folds
+  `UInt8.ofNat_toNat` internally) rather than naming the theorem.
+
 - 2026-10-18 — **Adding a predicate-guarded byte token (`satisfy : (A → Bool) → Codec A`, decoding
   "first element iff `p` it") to an inductive AST that is exhaustively `match d`ed in `Rel`/`decode`/
   `decodeFast`/`encode` (and every packed/committed mirror) means *every* match gains a case, and the
