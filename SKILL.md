@@ -466,6 +466,42 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-19 — **A `Codec`-value rewrite of a *fixed-width* digit codec (one byte per element) is a
+own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-width recipe —
+  element `Codec UInt8 := iso blockIso (count k (satisfy digitPred))` plus the repetition triple
+  `decodeRepeat`/`encodeRepeat`/`relRepeat` — works because the block `Iso` (`k` digits ↔ one byte) is a
+  clean bijection: both `law` directions close with `omega` on a per-digit `≤ bound` plus `Nat.div_add_mod`.
+  A base-N codec whose digits *cross* byte boundaries (e.g. 40 bits = 8 five-bit chars → 5 bytes) has element
+  `Codec (List UInt8)` and a block `Iso` whose **backward** law (`apply cs = bs → unapply bs = cs`) is
+  *encode-injectivity*: recover each char `cᵢ = valToX (σᵢ(bs))` from the bytes.  The old bespoke code only
+  proved `decode ∘ encode = id` (`decode (encode bs) = some bs`); it never proved `encode ∘ decode = id` on
+  valid input, which is exactly the missing `Iso.law` direction.  Reuse the existing byte-extraction
+  identities (`byte0..byte4`) *read in reverse* for the recover step, and a `char_eq_valToX_of_valid`
+  lemma (`c = valToX i` when `valid c ∧ toVal c = i`).  Do **not** reach for `by_contra` (it needs
+  `Classical.choice` and breaks the `[propext, Quot.sound]` gate): destruct each `char = pad` /
+  `valid char` guard with `by_cases`, close the impossible branches with `simp at h` + `omega`.
+
+- 2026-10-19 — **`Unambiguous (iso i d)` only needs `i.apply` to be *functional* (deterministic), not the
+  full `Iso.law` — but `encode_rel`/`encodeRepeat_rel`'s `iso` case *does* need the **forward** `law`
+  (`unapply x = some a → apply a = some x`).**  So `Unambiguous` of a `Codec.iso` leaf transfers for free from
+  the inner `Unambiguous` (`some x = some y`, `Option.some.inj`) with no bijection proof, yet you still must
+  construct the `Iso` with its full `law` field (both directions) before you can write the `Codec.iso`.
+  The backward direction is the genuinely-new sharp edge for non-bijective-looking block maps.
+
+- 2026-10-19 — **`Productive (count k (satisfy p))` holds only for `k ≥ 1`:** `count 0` relates the empty list
+  to the empty string, so it is *not* productive (`Rel (count 0 …) xs s → n = 0`, not `n ≠ 0`).  State the
+  generic `ConsumesByte` witness as `consumesByte_count_satisfy_succ p k : ConsumesByte (count (k+1)
+  (satisfy p))` (via `Productive_count_satisfy_succ`), never the `k = 0`-inclusive form, and write each base's
+  width as `k = m + 1` (`show 8 = 7 + 1 by rfl`) before applying it.
+
+- 2026-10-19 — **Factor the generic per-base proof lemmas into one shared module and `open` it, rather than
+  re-deriving them verbatim per base** — when a proof recipe repeats across N sibling modules, the generic
+  lemmas (`Productive_iso`/`_seq_left`/`_count_succ`/`_satisfy`, `Unambiguous_satisfy`/`_iso`,
+  `Rel_count_satisfy_len`, `count_satisfy_unambiguous`) are parameterized only by a byte predicate `p` and a
+  width `k`, so they belong in a `Common` namespace.  A left-nested 8-way `&&` (`(… && d7) = true`) decomposes
+  cleanly with `simpa only [Bool.and_eq_true_iff] using hv` into a *left-nested* `∧`, then `.1.1.1.…` /
+  `.….2` — do **not** hand-nest `Bool.and_eq_true_iff.mp` (the `.1`/`.2` count is easy to get wrong).
+
 - 2026-10-19 — **Proving a byte-substrate codec's *unambiguity* (`Unambiguous d := ∀ x y n s, Rel d x s →
   Rel d y s → x = y`) is the linchpin that gates the inherited repetition-level roundtrip**
   (`decodeFull_spec` needs `huniq : (x, Suffix.empty n) ∈ decodeRepeat … → (y, …) ∈ … → x = y`). The
