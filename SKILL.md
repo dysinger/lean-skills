@@ -466,6 +466,47 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-19 — **Define `Iso` `apply`/`unapply` as *named total functions* and prove `law` as a *separate
+  theorem* (`octBlockIso_law : octBlockApply cs = some b ↔ octBlockUnapply b = some cs`), then pack with
+  `{ apply := …, unapply := …, law := … }` — do **not** write the `law` field inline.** An inline `law := by
+  …` over a `match cs with | [d0,d1,d2] => …` list-literal pattern fights `simp [isoName]`/`dsimp`
+  ("invalid argument: variable `isoName` is not a proposition") because the `structure`'s `law` field is not
+  a reducible `simp` target, and `split at h` on the list-literal assigns *surprising* variable names
+  (`d1 d0 rest` from `[d0,d1,d2]`). Named functions let you `unfold octBlockApply`/`rw [octBlockApply]` on a
+  *plain `def`* and `cases cs`-destructure the list yourself with predictable names.
+
+- 2026-10-19 — **`Nat.div_add_mod m n` returns `n * (m / n) + m % n = m` — the *divisor first*.**
+  To get the `(m/n) * n + m%n = m` form a digit-sum identity needs, `simpa [Nat.mul_comm] using
+  Nat.div_add_mod m n`.  `omega` does *not* commute it for you, and an `omega`-only digit reconstruction
+  (`(v/64)*64 + ((v/8)%8)*8 + v%8 = v`) closes with just `have h1 := Nat.div_add_mod v 64; have h2 :=
+  Nat.div_add_mod v 8; omega` — but **only** when the divisor-first form is in the local context; `omega`
+  alone does not unfold `(v/8) % 8`.
+
+- 2026-10-19 — **`decide` lemmas:** the iff is `decide_eq_true_eq : (decide p = true) = p`; the one-direction
+  forward is `of_decide_eq_true : decide p = true → p`; there is **no** `decide_eq_false_eq` (the mirror is
+  `decide_eq_false : ¬ p → decide p = false` / `of_decide_eq_false`).  For a *left-associative* `&&` chain
+  `(P && Q && R) = true`, decompose with `(Bool.and_eq_true_iff.mp hv).1 : (P && Q) = true` then
+  `(Bool.and_eq_true_iff.mp that).1 : P = true` / `.2 : Q = true`, and `(Bool.and_eq_true_iff.mp hv).2 : R =
+  true` — `hv.1`/`hv.2.2` on a `Bool` equality is an "invalid projection" (a `Bool` equality has no fields).
+  Close a `(true && true && true) = true` residual (the `if (b : Bool)` desugars to `if b = true`) with
+  `have hh : (true && true && true) = true := by decide; rw [hh]` — `simp`/`#reduce` do **not** reduce `=
+  true` on its own.
+
+- 2026-10-19 — **`by_contra` needs `Classical` (or a `[Decidable]`/`Fintype` instance).**  In a
+  stdlib-only, `[propext, Quot.sound]`-only library (`no mathlib`, no `Classical.choice`), `by_contra` is
+  **not** available; proving `octToVal e ≤ 7 ⇒ 48 ≤ e` from `octValid e = true` must be done with `by_cases
+  hle : e ≤ 55 <;> by_cases hge : 48 ≤ e` and `omega` in each branch (the invalid branches yield
+  `octToVal e = 8`, contradicting `≤ 7`).  Do not reach for `by_contra`/`classical` in such a library — it
+  breaks the axiom gate.
+
+- 2026-10-19 — **A digit-decomposition *uniqueness* lemma (`d0·64 + d1·8 + d2 = e0·64 + e1·8 + e2`, each ≤ 7
+  ⇒ triples equal) closes with `congrArg (fun x => x / 64) h` and `congrArg (fun x => (x % 64) / 8) h`**, not
+  raw `omega` on `/`/`%`.  After `have hm := congrArg (fun x => x / 64) h`, give `omega` the *bound*
+  `have hbc : b * 8 + c < 64 := by omega` (so the `b*8+c` tail is `< 64`, hence `(a*64 + b*8+c)/64 = a`),
+  then `rw [hm', hm''] at hm; exact hm` — `omega` proves `(a*64 + b*8 + c) / 64 = a` **given** the tail
+  `< 64` bound, but the `%64 / 8` step additionally needs `c < 8` so that `(b*8+c) % 64 = b*8+c` and
+  `(b*8+c)/8 = b`.
+
 - 2026-10-19 — **A recursive inductive AST (`Codec α`) *cannot* carry a constructor whose field is a
   *semantic* predicate over that same AST's own denotation** — `many : (p : Codec α) → Productive p →
   Codec (List α)` with `Productive p := ∀ x n s, Rel p x s → n ≠ 0` forms the definition-order cycle
