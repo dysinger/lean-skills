@@ -466,6 +466,56 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-19 — **Proving a byte-substrate codec's *unambiguity* (`Unambiguous d := ∀ x y n s, Rel d x s →
+  Rel d y s → x = y`) is the linchpin that gates the inherited repetition-level roundtrip**
+  (`decodeFull_spec` needs `huniq : (x, Suffix.empty n) ∈ decodeRepeat … → (y, …) ∈ … → x = y`). The
+  working chain for a fixed-width `iso blockIso (count k (satisfy p))` leaf is: (1) `Rel (count k (satisfy p)) xs s`
+  **pins the byte length** `n = k` (prove `Rel_count_len` by induction on `k`: the `satisfy` RHS gives
+  `∃ h : m = 1`, `subst` it, then IH on the tail `s₂ : Bytes (n - 1)` gives `n - 1 = k`, close with `omega`);
+  (2) `count k (satisfy p)` is unambiguous by induction on `k`, where the succ case peels the head byte via
+  `splice_prefix_read` at index `0` and recovers the equal tails via `bdrop_splice`, then the IH on the
+  (same-type) tails; (3) `iso` preserves unambiguity (`i.apply a = some x` twice, `a = a'` by the inner
+  unambiguity, force `x = y` with `Option.some.inj`).
+
+- 2026-10-19 — **There is **no `norm_num`** in a stdlib-only (no-mathlib) Lean library** — `norm_num` is an
+  "unknown tactic" (the AGENTS rule lists it among `ring`/`nlinarith`/`fin_cases`/`interval_cases` as absent).
+  Close `Fin`-index arithmetic goals with `omega`/`simp`/`decide` only.
+
+- 2026-10-19 — **`Fin.val` of an anonymous `Fin` literal does **not** reduce for `omega`/`norm_num`/`decide`:**
+  the goal `↑⟨0, h0lt⟩ < 1` (from a `splice_prefix_read p … ⟨0, h0lt⟩ hi` call, where `hi : i.val < m` must be
+  supplied) sticks — `omega` reports a counterexample on the opaque atom `↑↑⟨0, h0lt⟩`, `decide` rejects the
+  free variable, and `norm_num` doesn't exist. The fix is **`by simp`** as the `hi` argument (and for the
+  `Fin n` well-formedness use a *named* `have h0lt : 0 < n := by omega` first), because `simp` reduces
+  `Fin.val ⟨0, _⟩` to `0` and closes `0 < 1`. Never leave `by norm_num`/`by omega`/`by decide` for such a goal.
+
+- 2026-10-19 — **Use `splice_prefix_read … ⟨0, hlt⟩ hi` to extract the head byte of a `splice`-split prefix,
+  and `bdrop_splice …` to recover the tail as the *same type* `Bytes (n - m)`** — when two `Rel`/`relRepeat`
+  witnesses both split the same `s` at the (productivity-pinned) length `m`, `s₁x = s₁y` follows by `Bytes.ext`
+  (read each `i : Fin m` through `splice_prefix_read` twice and `trans`), and `s₂x = s₂y` by `rw [← bdrop_splice
+  … s₁x s₂x, ← bdrop_splice … s₁y s₂y]` then `congr 1` on the `s` equalities. This is the transport that makes
+  an IH applicable over the *tails*.
+
+- 2026-10-19 — **`subst` on a length-equal witness (`hm0 : m = 0`) that contradicts an earlier
+  `have hlen : m = 3` hits "No goals to be solved"** — don't `subst` a length to a value that
+  contradicts another surviving witness. Instead keep both equalities as `have`s and close the
+  contradiction with a single final `omega` (`have hlen : m = 3 := …; have hm0 : m = 0 := by omega;
+  omega`). This is the relRepeat-`nil`-vs-`cons` productivity asymmetry case.
+
+- 2026-10-19 — **`relRepeat` (the least-fixpoint list relation) is unambiguous for a productive
+  `ConsumesByte` step by *list induction with `generalizing b n s`*, cased on `b` inside the cons case** —
+  `rw [relRepeat_cons] at hb` does **not** fire when `hb`'s subject is still the variable `b`; you must
+  `cases b` (→ `nil` / `cons y ys`) first so `relRepeat_cons` matches the `y :: ys` subject. The `nil`-vs-`cons`
+  asymmetry closes by productivity (`Rel octElem _ s₁` forces `m = 3`, but `m ≤ n = 0` forces `m = 0`;
+  `omega` on `m = 3` + `m = 0`).
+
+- 2026-10-19 — **The inherited repetition roundtrip law** (`decodeFull (encodeRepeat …) = some bs`) **chains**
+  `encodeRepeat_rel` (encoder → `relRepeat` witness) → `decodeRepeat_spec` `.2` (`relRepeat` witness →
+  `(bs, Suffix.empty n) ∈ decodeRepeat …`, using `cast (congrArg Bytes (Nat.sub_zero n).symm) s` +
+  `prepend_empty_eq` + `relRepeat_cast`) → `decodeFull_spec` `.2` (membership → `some bs`, gated by the
+  `huniq` uniqueness fact above). The `huniq` itself is proved via `decodeRepeat_spec` `.1` twice +
+  `prepend_prefix_eq` (to pin the two prefix witnesses `s₀x = s₀y` from the shared `t = (Suffix.empty n).prepend s₀`)
+  + the list-level unambiguity.
+
 - 2026-10-19 — **Define `Iso` `apply`/`unapply` as *named total functions* and prove `law` as a *separate
   theorem* (`octBlockIso_law : octBlockApply cs = some b ↔ octBlockUnapply b = some cs`), then pack with
   `{ apply := …, unapply := …, law := … }` — do **not** write the `law` field inline.** An inline `law := by
@@ -983,6 +1033,16 @@ names/paths); the specific repo lives elsewhere.
   `Fin.foldr_succ`/`getElem_cons_zero`/`getElem_cons_succ`).
 
 ## Changelog
+
+- 2026-10-19 — **Proving a byte-substrate codec's unambiguity is the gate to the inherited
+  repetition-level roundtrip.** Added seven entries (see "Append new learnings"): the
+  `Rel_count_len` / `count_satisfy_unambiguous` / `Unambiguous_iso` / `relRepeat`-unambiguity
+  induction chain; the absence of `norm_num` in stdlib-only; the `Fin.val`-of-`⟨0,·⟩`
+  reduction trap (`by simp`, not `by omega`/`by decide`/`by norm_num`); `splice_prefix_read` +
+  `bdrop_splice` as the same-type prefix/tail recovery transport; the `subst`-vs-`omega`
+  contradiction; `cases b` before `rw [relRepeat_cons] at hb`; and the 5-step inherited
+  `decodeFull` roundtrip (`encodeRepeat_rel` → `decodeRepeat_spec` → `decodeFull_spec` with a
+  `prepend_prefix_eq`-pinned `huniq`).
 
 - 2026-10-17 — **A length-indexed function (`Fin n → T`) is a scalar *read* substrate and a
   nested-closure *bulk-write* substrate — do not claim "one pure carrier does both reads and
