@@ -466,6 +466,80 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-20 — **A plain `decide` on a *closed* structural-match equality is `[propext]`-only (definitional),
+  `native_decide` leaks a `.native`/IO axiom — never use `native_decide` in a gate theorem.** If the goal
+  is `someTailTerminalParser [literal, byte list] = none` where the parser is a `def` of `if`/`match` over
+  `Bool`/`Nat` and the literals are concrete, `unfold <parser>; decide` closes it and `#print axioms` reports
+  only `[propext]` (better than `[propext, Quot.sound]`). The existing "`decodeFull`/`Rel` have no `Decidable`"
+  caveat applies to the *fixpoint* decoder, **not** to a hand-written structural `match` parser over `List
+  UInt8`/concrete bytes.
+
+- 2026-10-20 — **`l ++ []` is not `rfl`-equal to `l`; in an induction step that emits `chars ++ []` vs the
+  lemma's `chars`, `rw [← List.append_nil chars]` first (it rewrites `chars` to `chars ++ []`).** A total
+  char-emitter `chars : B → List UInt8` leaves the `full/tail` case goal as `parse (chars)`, while the helper
+  lemma is stated as `parse (chars' ++ rest) = …`; for the `rest = []` base, `simpa`/`rw` do not see the `++ []`,
+  so insert `rw [← List.append_nil <chars>]` to align, then `rw [helper … []]`. (`List.append_nil : l ++ [] =
+  l`; the `←` direction is `l = l ++ []`.
+
+- 2026-10-20 — **Make an illegal *run-level* shape impossible by replacing a homogeneous list type with a
+  terminal-maker inductive.** A "blocks + at most one terminal tail" language whose value type is
+  `List (List UInt8)` *admits* "tail-then-full" (`[[b],[b0,b1,b2]]`) by construction; no guard/filter/
+  post-condition over that type is "perfect" because they all detect-and-discard an already-built illegal
+  value. The fix is a value type whose *tail constructors have no continuation*: `inductive B where | nil
+  | full (b0 b1 b2) (rest : B) | tail1 (b0) | tail2 (b0 b1)` — `tail1`/`tail2` are terminal, so "data after a
+  tail" has no term, and the only way to write "a 1-byte then a 3-byte block" is `full 0 0 0 (tail1 x)` (the
+  *valid* order). The decoder `Bytes/List UInt8 → Option B` is total and returns `none` exactly when no `B`
+  term matches; every `some v` *is* canonical. Rejection is the *absence of an inhabitant*, not a filter.
+  This is the honest "types dictate impossibility": the compiler rejects the illegal shape.
+
+- 2026-10-20 — **A "flatten" from a two-part sum/product value to a plain list is usually *non-bijective*,
+  so there is no flattening `Iso` — don't plan one.** "`full* (tail)?`" as `List Block × Option Tail` →
+  `List Block` via `(bs, t) ↦ bs ++ t.toList` is NOT injective (a full-width `t` collides with it being the
+  last *full* block of `bs` with `t = none`). If you need both shapes, keep the two-part value (or the
+  terminal-tail inductive above) as the *proven* type and drop the flat list from the proven surface; a
+  `List`-append that injects an `Option`/tag is a transport, not a law-bearing `Iso`.
+
+- 2026-10-20 — **`open Codec` (or any `open`) makes bare lowercase constructor names parse as *pattern
+  variables*, breaking `match`/`induction` arms.** After `open Codec`, `| empty => … | full b0 b1 b2 r => …`
+  in a `def/inductive` over your own `inductive B` fails: `empty` resolves to `Codec.empty` (type mismatch)
+  and `full`/`nil`/`tail1` are read as lowercase pattern *variables* ("invalid pattern … `B.full` would be
+  valid"). Always qualify your own constructors (`B.full …`, `B.nil`) or use leading-dot notation (`.full`,
+  `.nil`), and rename `empty` (→ `nil`) to dodge the `Codec.empty` clash entirely.
+
+- 2026-10-20 — **Reuse an existing lenient block-decoder (with its per-shape identities) to build a strict
+  structural parser, instead of re-deriving the digit/`if` math.** A strict whole-input parser over a
+  terminal-tail inductive needs each block's `List bytes → Option (List bytes)` (1–N byte shape) and the
+  per-shape `decode (encode bs) = some bs` facts; if a *lenient* block decoder plus `*_unapply_single/pair/
+  triple/…` theorems already exist, write the strict parser as `match lenientDecode [c0..ck] with | some
+  [b] => tail1 b | some [b0,b1] => tail2 b0 b1 | some [b0,b1,b2] => full … (recurse) | …`, and prove the
+  per-shape lemmas with a single `simp [parser, charEmitters, theUnapplyLemma]` — no `by_cases`/`omega` digit
+  re-derivation, no byte-identity reconstruction. The strictness is all in the *value type* + which patterns
+  recurse, not in new digit proofs.
+- 2026-10-20 — **`Codec.decodeFull` and `Rel d` have **no** `Decidable` instance, so concrete value-check
+  vectors cannot close with `decide`/`by_decide` — only `native_decide`, which leaks a `.native` axiom and
+  must stay out of gate theorems.** `decodeFull p h n s` recurses via `WellFounded.fix` and `Rel` is a
+  structural `Prop` over the `Codec` AST, so `decide` on `decodeFull … = some […]` gets stuck at the
+  `WaitFounded.fix`/`fix_eq` stage and `Rel …` fails to synthesize `Decidable`. The gate-clean (`[propext,
+  Quot.sound]`-only) route is `decodeFull_spec` + `decodeRepeat_spec` + `relRepeat`/`relRepeat_cons` +
+  `encode_rel`, where each *block*-level `Rel elem bs s` fact is obtained **from the encoder**
+  (`encode_rel elem bs` gives `encode elem bs = some ⟨k, s⟩ → Rel elem bs s`, and `encode elem bs = some
+  ⟨k, literal⟩` closes by `simp` because the block `Iso`'s `unapply` is a plain `match`, not a fixpoint).
+  But `encode elem bs` itself does **not** `rfl`-reduce end-to-end: the inner `encode (count k (satisfy p))`
+  leaves the `if p (single-bytes) …` conditions unfolded, and closing them needs `decide` on each concrete
+  digit arithmetic (`valToX c = i`, `pred b = true`), which **does** `decide`-close (they are closed `Nat`/
+  `Bool` equalities). Keep `native_decide` only in a **bench `example`/`#eval`** (not a proved theorem).
+
+- 2026-10-20 — **The forward direction `Rel (count k (satisfy p)) l s` (from `s = byte-image of l` + `∀ b ∈ l, p b`)
+  is a genuinely-needed lemma with a `splice`/`cast`/`(k+1)-1` index-cast gotcha: the succ case must walk down
+  via `count (k+1) = iso cons (seq (satisfy p) (count k (satisfy p)))`, splitting `s` at `1`, and the tail is
+  `Bytes ((k+1)-1)` which is **not** definitionally `Bytes k`** — so rather than `bdrop 1 s` (type-mismatch
+  against the IH's `Bytes k`), define `s' : Bytes k := fun i => s ⟨i.val + 1, by omega⟩` and cast it into the
+  `splice` suffix (`cast (congrArg Bytes (by omega : k = (k+1)-1)) s'`), proving the head via `Rel_satisfy`
+  and the tail via the IH on `s'`.**  The splice equality `s = splice 1 (single b) (cast … s')` closes by
+  `Bytes.ext` + `splice_apply` + `by_cases h : i.val < 1` (head) / `simp` + the image hypothesis (tail).  This
+  `(k+1)-1 = k` (a `Nat.sub` reduction, **not** definitional) is the recurring gotcha behind every
+  length-indexed `Bytes n` recursion step.
+
 - 2026-10-20 — **`count k (satisfy p)` fixes the *consumed byte window* (`k`), NOT the decoded *value*
   length — so a cross-block (run-level) invariant is not expressible as a refinement of the element, it
   needs a run-level guard.**  A block codec `iso blockIso (count k (satisfy pred))` consumes exactly `k` bytes
