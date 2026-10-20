@@ -466,6 +466,37 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-20 — **`count k (satisfy p)` fixes the *consumed byte window* (`k`), NOT the decoded *value*
+  length — so a cross-block (run-level) invariant is not expressible as a refinement of the element, it
+  needs a run-level guard.**  A block codec `iso blockIso (count k (satisfy pred))` consumes exactly `k` bytes
+  per element *regardless* of what the value is; padding/`=`-position affects the *value* (`1` vs `3` bytes),
+  not the window. So an intra-block property (e.g. `=` in a non-terminal position *within* a `k`-char block) is
+  correctly rejected by the block `Iso`'s backward law, but a *cross-block* property (e.g. "no data after a
+  terminal `=`", i.e. a `=`-terminated block must be the *last* block) is **accepted** by `decodeRepeat`
+  (grouping input into fixed `k`-wide blocks) and must be enforced by either (a) splitting the run into a
+  full-block `decodeRepeat` prefix + an optional terminal **tail** block via `seq`/`alt`/`empty`, or (b) a
+  whole-input post-condition theorem on `decodeFull` — **not** by a length argument (`"padded block has value
+  length < k so it can't be followed by a full block"`), which is a *false premise*: the window, not the value
+  length, is what `count k` fixes.
+
+- 2026-10-20 — **Case-insensitivity is NOT expressible as a `Codec` value over a strict `Iso`.** A
+  normalizing map (e.g. hex `A` and `a` → the same nibble) is **not a bijection** (two inputs → one output), so
+  it cannot be an `Iso` field and it breaks `Unambiguous` (two distinct inputs relate to one value). If a format
+  spec mandates case-insensitive *decoding* (RFC 4648 §8 for hex), that must live in a **separate
+  case-normalizing facade** outside the `Codec` value — a `satisfy`+normalizing-`iso` `Codec` is a category
+  error. Record a case-insensitive acceptance as a **non-goal** for the `Codec` value, not a test that the
+  `Codec` "should" pass.
+
+- 2026-10-20 — **When re-anchoring a plan to a rewritten surface, verify the *ground truth* of every "the code
+  does X" claim before stating it as fact — a spec-driven plan that asserts "the decoder accepts lowercase /
+  rejects trailing padding" against code that provably does the opposite will be caught by a reviewer and
+  must be re-derived.** For `decodeFull`/`decodeRepeat`-based surfaces: the whole-input decoder is
+  `decodeFull elem consumesByte n s : Option (List α)` (or `List (List α)` for a block element), **not** a
+  bespoke `decode : List UInt8 → Option (List UInt8)` facade; and the block vs fixed-width split is element
+  `Codec UInt8` (one byte) vs element `Codec (List UInt8)` (a multi-byte block). Write an explicit
+  "ground truth the plan must respect" section with the verified signatures and the deterministic outcome of
+  the contested case (`decodeFull … "Zg==AAAA" = some […]`), so reviewers re-check claims, not guess.
+
 - 2026-10-19 — **A `Codec`-value rewrite of a *fixed-width* digit codec (one byte per element) is a
 own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-width recipe —
   element `Codec UInt8 := iso blockIso (count k (satisfy digitPred))` plus the repetition triple
