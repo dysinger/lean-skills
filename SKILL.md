@@ -318,6 +318,24 @@ all-inductives. If a `Rel` (structural `def`) and a companion `RelMany` (the lea
 then call it with `Rel p` — `Rel` stays a transparent structural `def` (so `Rel_*` lemmas stay
 `Iff.rfl`/`by simp [Rel]`), and the recursion is on the finite list, not the description.
 
+**A `many` constructor carrying a *denotational* productivity witness is un-implementable —
+derive `many`, don't construct it.** Trying `many {α} (p : Codec α) (h : Productive p) :
+Codec (List α)` with `Productive p := ∀ x n s, Rel p x s → n ≠ 0` (or `ConsumesByte`, which
+mentions `decode`) creates the definition-order cycle `Codec → (witness) → Rel/decode → Codec`:
+the constructor field mentions `Rel`/`decode`, both of which structurally recurse on `Codec`.
+Lean rejects the two escapes: mixing a `def` with an `inductive` in a `mutual` block is forbidden,
+and a `mutual inductive Codec (Type → Type 1) + Rel (… → Prop)` is rejected by the universe
+check ("All inductive types declared in the same `mutual` block must belong to the same type
+universe"). A *syntactic* productivity `def` recursing on `Codec` has the identical
+`Codec → productive → Codec` cycle. **Resolution (paper §3.4 + F\* `satisfy_many0`):** `many`
+is a *derived* recursive combinator (`many p = nil $ pure () | cons $ p ∗ many p`), never an AST
+node; realize it as the **parameterized `relRepeat R` / `decodeRepeat p h` / `encodeRepeat p`
+triple**, and surface a concrete format as a **first-class run value** (a `structure` bundling
+`elem : Codec α` + `step : ConsumesByte elem`, with `decode`/`encode`/`rel` inherited from the
+proved repetition) rather than a bespoke per-format function. Do **not** re-fight this: a
+`many`-as-constructor is not a Lean expressibility gap to overcome, it is the wrong shape, which
+the paper and the F\* reference both avoid by deriving repetition.
+
 **`sizeOf` on a recursive inductive is opaque through its `SizeOf` instance.**
 `sizeOf p < sizeOf (many p)` does not close by `simp`/`omega` because `sizeOf` uses
 the `[instance_reducible]` `_sizeOf_inst`, and `Codec._sizeOf_1` (the auto-generated size
@@ -465,6 +483,111 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
+
+- 2026-10-22 — **`termination_by` on a `where`-nested recursive proof must name the *helper's own* parameter, not the
+  outer theorem's binder.** A `theorem f (bs) : … := exact go bs where go : (l : List α) → …` with `go` recursing
+  three-elements-deep (`b0 :: b1 :: b2 :: t2 ↦ go t2`) needs `termination_by l => l.length` **inside `go`'s
+  definition** (`decreasing_by …` right after the `where` cases) — writing `termination_by bs.length` after the whole
+  theorem errors `Unknown identifier bs.length`. Also: `decreasing_by simp_arith` is **deprecated** (shorthand for
+  `simp +arith +decide`); write `decreasing_by simp +arith` to stay zero-warning. A 3-deep/short-block-length recursion
+  is the classic case where plain `induction` gives an IH only on the *immediate* tail, not the `t2` you need — use the
+  `where` helper with its own `termination_by`.
+
+- 2026-10-22 — **A *terminal-tail* inductive has a *bijective* `List UInt8` flatten, unlike a homogeneous
+  `List (List UInt8)` (which is NOT bijective).** "full blocks (width `k`) then at most one terminal tail (1..k-1 bytes)"
+  as `inductive B where | nil | full (b0…b(k-1)) (rest : B) | tail1 … | tail(k-1) …` flattens to `List UInt8`
+  **injectively**: the block/tail boundary is recovered from `length mod k` (0 ⇒ all-full, `r ∈ 1..k-1` ⇒ a single
+  `r`-byte `tail r`), and the terminal constructors carry no continuation. So a **uniform facade over one value type
+  `List UInt8`** is achievable by a *bijective* transport `B ↔ List UInt8` (flatten + split-by-`length mod k`), with
+  roundtrip `flatten ∘ split = id` proved by a 3-/5-deep `where` recursion and `split ∘ flatten = id` by structural
+  induction on `B`. This is distinct from the earlier "flatten `List Block × Option Tail` → `List Block` is
+  non-bijective" note: that failure is about colliding a *full-width* tail with the *last full block*; a
+  **value-type-level** terminal-tail maker (`tail r` has no continuation, `full` always has full width `k`) avoids the
+  collision, so the flatten is genuinely injective.
+
+- 2026-10-22 — **`Bytes n → List UInt8` is materialized by `List.ofFn s`; do not assume a stable
+  `List.ofFn_get`-style lemma name.** `abbrev Bytes n := Fin n → UInt8`, so `def bytesToList {n} (s : Bytes n) : List UInt8 :=
+  List.ofFn s` and `def listToBytes (l) : Bytes l.length := fun i => l[i]` are the two directions of a `Bytes n ↔ List UInt8`
+  bridge. Proving `bytesToList (listToBytes l) = l` needs a "`List.ofFn (fun i => l[i]) = l`" fact; the stdlib lemma name
+  (`List.ofFn_get` vs `List.getElem_ofFn`) is **version-specific** (absent in the rusted 4.30 pin), so either `funext`/
+  `Fin`-induct by hand or defer the inverse lemma until a roundtrip proof actually needs it (the facade types alone need
+  only the two definitions, not their inverse law).
+
+- 2026-10-20 — **The converse (`decode s = some v → encode v = s`) is *false* unless the decoder is
+  **canonical**; a "lenient" block decoder that accepts dropped-bit non-canonical encodings breaks it.**
+  For a fixed-width/padded *block* `List UInt8 → List UInt8`, the "lenient" decode that only checks pad
+  *positions* (not that the recovered value's low bits are zero) accepts e.g. `"AB=="` → byte `0x00` for the
+  1-byte tail, even though the canonical encoder emits `"AA=="`.  So `decode "AB==" = some 0x00` holds but
+  `encode 0x00 = "AB=="` is false, and the converse is **unprovable**.  The fix is not a theorem: switch the
+  parser to the **re-encode-checked** block apply (`apply cs = (lenientDecode cs).filter fun bs => unapply bs = some cs`),
+  i.e. `apply cs = some bs ↔ unapply bs = some cs` — then decode only succeeds on canonical blocks and the
+  converse `apply cs = some bs → unapply bs = some cs` is the literal backward `Iso.law` direction.  Detect the
+  gap by `#eval` on a concrete dropped-bit vector (`lenientDecode "AB=="` vs `apply "AB=="`), not by reading names.
+
+- 2026-10-20 — **A successful *structural* parser's completeness (`parse s = some (v, r) → charsOf v ++ r = s`)
+  is a direct structural recursion on `s` — but the recursive branch only fires four/eight elements *deep*,
+  so pattern-match the full depth and reassociate `++` before rebuilding.**  Write `parse`'s list pattern as
+  `c0 :: c1 :: c2 :: c3 :: rest` (or `c0..c7 :: rest` for an 8-wide block) so `rest` is a **strict subterm** and
+  the recursive IH call `parse rest` is accepted by the termination checker.  In the full-block branch, `unfold
+  charsOf` then `rw [List.append_assoc]` **before** `rw [ih]`: the goal is `(fullChars ++ charsOf v') ++ r'`
+  (definitional nesting), not `fullChars ++ (charsOf v' ++ r')`, so `ih : charsOf v' ++ r' = rest` won't match
+  until `List.append_assoc` reassociates; then `rfl` closes `fullChars ++ rest = c0::…::rest` after the block
+  `unapply bs = some cs` fact pins `fullChars = [c0..ck]`.
+
+- 2026-10-20 — **Core `Nat.toDigits base n : List Char`/`Nat.digitChar` are *not* drop-in replacements for a
+  fixed-width base-`N` encoder** — they are LSB-first, variable-width, **zero-un-padded**, run over `Char` (not
+  `UInt8`), emit **lowercase** `a-f` for base ≥ 11, and `digitChar` hard-caps at `≥ 16 → '*'`.  A fixed-width
+  encoder (one byte → exactly `k` MSB-first, zero-padded `List UInt8`, uppercase hex, custom base32/64 alphabets)
+  needs `Nat.toDigits 8 1 = ['1']` padded to `['0','0','1']` and its `Char` mapped through `Char.toUInt8` — a
+  reverse + left-pad + map that is strictly *more* allocating than the bespoke `valToX`/`bitAt`/`*BlockUnapply`
+  over the same boxed `Nat` div/mod, so adopting it is a slowdown, not a simplification.  There is **no**
+  `Nat.ofDigits` (parse-back) in core.  `Nat.toDigits` is only right as a non-law-bearing *display* helper
+  (`render base n`), kept outside the proven codec surface.
+
+- 2026-10-20 — **The repetition-level *converse* (`decode … = some v → encode v = some ⟨n, s⟩`) is a two-prime
+  machinery, all free of `codec` changes: `relRepeat_functional` + `encodeRepeat_of_rel`.** First prove, by
+  induction on the list, that a *list* value relates to at most one length+bytes pair given the *step*
+  relation is functional: `∀ xs n₁ n₂ s₁ s₂, relRepeat R xs n₁ s₁ → relRepeat R xs n₂ s₂ → ⟨n₁,s₁⟩ = ⟨n₂,s₂⟩`
+  from `relFunctional R` (the step-level `∀ a s₁ s₂, R a s₁ → R a s₂ → ⟨n₁,s₁⟩ = ⟨n₂,s₂⟩`).  The induction's
+  cons case closes by `hR x s₁₁ s₂₁ hx₁ hx₂` on the heads (then `cases` on the resulting **Sigma** equality),
+  recurse `ih s₁₂ s₂₂`, `congrArg Sigma.fst` to get `n₁-m = n₂-m → n₁ = n₂` via `omega` (add the `m ≤ nᵢ`
+  witnesses), `subst`, then `cases hfull; rfl` for the `.snd`.  Then `encodeRepeat_of_rel p (hR :
+  relFunctional (Rel p)) : relRepeat (Rel p) xs n s → encodeRepeat p xs = some ⟨n, s⟩` is
+  `encodeRepeat_ne_none` + `cases (encodeRepeat p xs)` + `encodeRepeat_rel` + `relRepeat_functional` — **never**
+  hand-roll the `concat`/`splice` reassembly in `encodeRepeat`'s body.  `relFunctional (Rel d)` **is**
+  `Functional d` definitionally (unfold `Functional`), so providing `Functional elem` is enough.
+
+- 2026-10-20 — **`Functional` (one value → one bytes pair) has free generic lemmas; add them once, don't prove
+  per codec.** `Functional (satisfy p)` (two `Rel_satisfy` then `rw [hs₁', hs₂']`), `Functional (count k
+  (satisfy p))` (induction on `k`; the succ case pins `a₁.1 = a₂.1` and `a₁.2 = a₂.2` from `Iso.cons.apply`
+  via `List.cons.inj` of `ha₁.trans ha₂.symm`), and the key `Functional_iso i d hd : Functional (iso i d)`
+  closes by `(i.law a b).1` twice (⇒ `i.unapply b = some aᵢ`, a *function*, ⇒ `a₁ = a₂` via `Option.some.inj`)
+  then `hd a₁ s₁ s₂`.  `Functional (iso blockIso (count k (satisfy p)))` is then `Functional_iso` + `Functional_count_satisfy` — this is what makes each fixed-width element's converse close without any digit math.
+
+- 2026-10-20 — **Canonical-encoding ("output alphabet-only") theorems are a *backward* forall, not a forward
+  relation: `Rel_count_satisfy_forall` + `relRepeat_forall`.** `Rel (count k (satisfy p)) xs s → ∀ i : Fin n,
+  p (s i) = true` lifts to the whole run via `relRepeat_forall p (hstep)`, where `hstep` passes each `Rel
+  <elem> x t` through `Rel_iso` to reach `Rel (count k (satisfy p)) a t` and then `Rel_count_satisfy_forall`.
+  Combined with `encodeRepeat_rel` (encode → `relRepeat (Rel elem)`), the theorem `encode{X} bs = some ⟨n,s⟩ →
+  ∀ i, digit (s i) = true` is `relRepeat_forall digit (fun x .. => …) bs n s (encodeRepeat_rel …)`.  `Rel_count_satisfy_forall`'s succ case walks `Rel_iso`/`Rel_seq`/`Rel_satisfy`, `subst m` (the `Rel_satisfy`
+  pins the head length to `1`), then splits `i.val < 1` with `splice_prefix_read` (head) vs `splice_apply` +
+  `unfold concat` + `rw [cast_fin_symm]` + `dsimp` + `simp [hi]` (tail — the `cast_fin_symm` leaves a `1 + (n-1)
+  = n` side-goal closed by `omega`).
+
+- 2026-10-20 — **A *concrete* rejection `decodeFull p h n s = none` for a fixpoint decoder closes by unfolding
+  the `WellFounded.fix` one step and letting `decode p s` compute — no `Rel`/`satisfy` inversion.** When `decode p
+  s = []` reduces by `rfl` (e.g. the block `Iso.apply` returns `none` for an over-`255`/illegal block), then
+  `unfold decodeFull; rw [WellFounded.fix_eq]; simp only; rw [Codec.decodeFullStep.eq_def]; simp; rfl` proves
+  `= none` (the `simp only` reduces the `match ⟨n, s⟩` scrutinee to the `succ` branch; `decodeFullStep` on the
+  empty `.attach` list is `none`).  Do **not** `rw [decodeFullStep]`/`unfold decodeFullStep` (it has `match_3`
+  cases with dependent `.attach` motives); use `Codec.decodeFullStep.eq_def` (the auto-generated equation) and
+  let `simp` discharge the `.attach`.
+
+- 2026-10-20 — **`simp` applies `or_self` (`p ∨ p ↔ p`), so `rcases` on a *deduplicated* disjunction after
+  `simp` needs fewer patterns than the list length.**  `b ∈ [c0, c1, 61, 61]` simplifies to `b = c0 ∨ b = c1 ∨
+  b = 61` (the duplicate `61` disjuncts merge), so `rcases hb with rfl | rfl | rfl` (3 arms), not 4.  This bites
+  when a tail builder emits repeated `=` pads of the same literal; count *distinct* disjuncts after `simp`,
+  not input list elements.
 
 - 2026-10-20 — **A plain `decide` on a *closed* structural-match equality is `[propext]`-only (definitional),
   `native_decide` leaks a `.native`/IO axiom — never use `native_decide` in a gate theorem.** If the goal
