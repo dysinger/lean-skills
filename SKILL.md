@@ -484,6 +484,39 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-23 — **`decodeFull p h n s` is insensitive to a length cast of its byte argument, and this is a
+  one-line lemma (`subst e; rfl`), not a long `splice`/`concat` chase.**
+  `decodeFull_cast p h : ∀ {n m} (e : n = m) (s : Bytes n), decodeFull p h m (cast (congrArg Bytes e) s) =
+  decodeFull p h n s`. Use it (together with the already-proved `bdrop_concat`) to reduce a tail-decode over a
+  *dropped suffix* `(Suffix.drop m (concat sb st)).bytes` back to a decode over the bare `st` — the `Suffix.drop`
+  fields reduce to `m+t-m`/`bdrop m (concat sb st) = cast (congrArg Bytes (Nat.add_sub_cancel_left m t).symm) st`,
+  and `decodeFull_cast … (Nat.add_sub_cancel_left m t).symm st` absorbs the cast, so a `decodeFull_b64Tail_of_encode
+  st` result transfers verbatim. This is the clean *cast*-level transport the padded-base whole-input roundtrip needs,
+  and it replaces fighting the dependent `Bytes` reindexing by hand.
+
+- 2026-10-23 — **`Functional` (one value → at most one `⟨n, s⟩`) is the clean way to *pin content*, and it
+  avoids `List.ofFn`/`Fin`-cast index arithmetic entirely.**  `Functional d : ∀ x n₁ n₂ s₁ s₂, Rel d x s₁ → Rel d x s₂
+  → ⟨n₁,s₁⟩ = ⟨n₂,s₂⟩`. So given `Rel d x s`, get `hne : encode d x ≠ none` via `encode_ne_none`, `cases he :
+  encode d x`, and `hrel' : Rel d x e.2` via `encode_rel`; then `functional x s e.2 h hrel'` is a **Sigma** equality
+  `⟨n,s⟩ = e` and `cases` it substitutes `s := e.2` — i.e. `s` is exactly the *encode* of `x`. This is the replacement
+  for a `Rel (count k (satisfy p)) xs s → s pins xs pointwise` content-extraction lemma, which in a stdlib-only Lean
+  is genuinely painful: `List.ofFn_succ` needs a `Fin (n+1)` scrutinee, and rewriting `n = (n-1)+1` into a
+  `splice hm (…)` (whose `hm : 1 ≤ n` depends on `n`) raises a dependent-motive error, while `List.ext_getElem`/
+  `List.getElem_ofFn` then leave `omega`-unclosable index-bound goals (`i < (List.ofFn s).length` vs `i < xs.length`).
+  Prefer the `Functional`+`encode` pin and make the *encode* side concrete (`#eval` it once), not the `Rel` side.
+
+- 2026-10-23 — **A `List.head?`-over-`filterMap` whole-input decoder needs a *committed-prefix uniqueness* lemma,
+  and its crux is a character *dichotomy*, not a length argument.**  `decodeFullX s = List.head? ((decodeRepeat …).filterMap
+  fun ⟨blocks,t⟩ => …)` returns the *first* commit, so `= some bs` needs: (a) `bs` is *in* the filterMap (by
+  `decodeRepeat_prefix_concat` + the tail-decode-over-suffix transport), and (b) every commit equals `bs` — which needs
+  the block run to be unable to consume into the terminal tail's pad byte, and the tail unable to start inside the
+  block run's alphabet-only prefix. Both halves need one primitive each: "a block element (`Rel (count k (satisfy
+  char))`) never relates to a string containing a pad byte" (from `Rel_count_satisfy_forall` + `char pad = false`,
+  closed by `decide`) and "a tail element always relates to a string containing a pad" (from the tail `Iso.unapply`
+  emitting a concrete `[c₀, c₁, 61, 61]`/`[c₀, c₁, c₂, 61]`). Do not try to avoid the dichotomy by a pure length
+  argument — the tail element's `count k (satisfy orPad)` predicate is lenient (accepts alphabet *or* pad), so only
+  the `Iso`'s 1..k-1-byte output restriction forces the pad, and that needs the content pin.
+
 - 2026-10-22 — **`decodeFull p h n s : Option (List α)` double-wraps when `α` is itself a list type: for a
   block element `Codec (List UInt8)`, it returns `Option (List (List UInt8))` (a list of blocks), not
   `List UInt8`.**  So a whole-input decoder that runs full blocks then a terminal tail and flattens to bytes
