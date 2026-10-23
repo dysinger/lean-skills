@@ -484,6 +484,87 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-22 — **`decodeFull p h n s : Option (List α)` double-wraps when `α` is itself a list type: for a
+  block element `Codec (List UInt8)`, it returns `Option (List (List UInt8))` (a list of blocks), not
+  `List UInt8`.**  So a whole-input decoder that runs full blocks then a terminal tail and flattens to bytes
+  must write `blocks.flatten ++ tail.flatten` (both sides are `List (List UInt8)`), not `… ++ tail`.  This is
+  the one place the *value type* vs the *list-of-values* distinction bites: the element's value is a byte
+  list, so one decoded block is a `List UInt8` and the run of blocks is a `List (List UInt8)`; `decodeFull` of
+  a single padded tail returns `some [[b]]` (or `some []` for the empty tail), and `decodeRepeat`'s step
+  value `[b] : List UInt8` must be written `[[b]]` when passed as the `xs : List (List UInt8)` argument of
+  `decodeRepeat_spec`/`relRepeat_cast`/`decodeFull_spec`.
+
+- 2026-10-22 — **`encodeRepeat p [x]` is NOT `rfl`-equal to `encode p x`; it returns `⟨q + 0, concat s emptyBytes⟩`**
+  (the `[]` tail of the match appends a `concat`-with-empty step and a `n + 0` length).  The encoder-soundness
+  bridge `encodeRepeat_rel p [[x]]` then gives `relRepeat (Rel p) [[x]] (q + 0) (concat s emptyBytes)`, not
+  `relRepeat … q s`.  Bridge with a one-line `concat_empty_eq {n} (s : Bytes n) : concat s emptyBytes =
+  cast (congrArg Bytes (Nat.add_zero n)) s` (prove by `Bytes.ext; intro i; unfold concat; have hi : i.val < n
+  := i.isLt; simp [hi]`), then `rw [concat_empty_eq]` + `(relRepeat_cast (Rel p) [[x]] (Nat.add_zero q) s).1`.
+  (Keep a *bounded* element encoder on the bare `Codec.encode` so its result length is the exact `q`, and pay
+  the `+0`/`concat-empty` transport only where `encodeRepeat` is forced.)
+
+- 2026-10-22 — **`relRepeat_cons R x xs` returns an `Iff` but is a *function* until the byte string `s` is
+  supplied — `relRepeat_cons (Rel p) x xs s`, then `.mpr ⟨m, hm, s₁, s₂, h_splice, hx, h_rest⟩` to build
+  `relRepeat` from its `∃` witness (NOT `.2`, which is an `And` projection and fails "projections cannot be
+  used on functions"/`Function.mpr`).**  The `(s : Bytes n)` argument is explicit; without it the term is
+  `(s) → Iff` and both `.mpr`/`.2` project off a function.  Also `relRepeat_nil R` takes an explicit `s
+  : Bytes n` too (`relRepeat_nil R s : relRepeat R [] n s ↔ n = 0`).
+
+- 2026-10-22 — **`decodeFull_spec`'s uniqueness argument `huniq` has an exact shape to match argument-free:**
+  `∀ {x y : List α} {n : Nat} (s : Bytes n), (x, Suffix.empty n) ∈ decodeRepeat p h n s → (y, Suffix.empty n)
+  ∈ decodeRepeat p h n s → x = y`.  Pass it as `(fun {x y} {m} (t : Bytes m) => <Xxx>DecodeFull_unambiguous (s := t))`
+  where the named `<Xxx>DecodeFull_unambiguous` lifts the `relRepeat`-level `relUnambiguous` ind (itself proved by
+  the `relRepeat_nil`/`relRepeat_cons` productivity argument with the element's `Rel_<elem>_len` fact pinning the
+  block width `m = k` against `m = 0` via `omega`).
+
+- 2026-10-22 — **The transport lemma family for a padded-base whole-input roundtrip is now *provable*, and it is a
+  set of three generic `Bytes`-level facts (put them in a common module, reused by every padded/uniform base):**
+  `bdrop_concat {m₁ m₂} (sb : Bytes m₁) (st : Bytes m₂) : bdrop m₁ (concat sb st) = cast (congrArg Bytes
+  (Nat.add_sub_cancel_left m₁ m₂).symm) st` (prove by `Bytes.ext; intro i; rw [cast_bytes_val' (e := …)]; dsimp
+  [bdrop, concat]; have hnot : ¬ i.val + m₁ < m₁ := by omega; simp [hnot]`); `concat_eq_drop_prepend sb st :
+  concat sb st = (Suffix.drop m₁ (concat sb st)).prepend (cast (congrArg Bytes (show m₁ = (m₁+m₂) - (Suffix.drop
+  m₁ (concat sb st)).remaining from by dsimp [Suffix.drop]; exact (Nat.sub_sub_self (Nat.le.intro rfl : m₁ ≤ m₁+m₂)).symm))
+  sb)`; and `decodeRepeat_prefix_concat p h xs sb st : (xs, Suffix.empty m₁) ∈ decodeRepeat p h m₁ sb → (xs,
+  Suffix.drop m₁ (concat sb st)) ∈ decodeRepeat p h (m₁+m₂) (concat sb st)`. The last one is `decodeRepeat_spec … .2`
+  with witness `srel = cast … sb`; its two sub-goals are `concat sb st = r.prepend srel` (by `concat_eq_drop_prepend`)
+  and `relRepeat (Rel p) xs … srel` (by `relRepeat_cast` over `hidx` plus `sb = s₀` from `prepend_empty_eq`). These
+  three are the whole *new* construction the roundtrip composes on top of the already-proved
+  `decodeRepeat_spec`/`encodeRepeat_rel`/`relRepeat_functional`; do **not** attempt to re-derive the `splice`/`concat`
+  arithmetic inline in each base.
+
+- 2026-10-22 — **`Nat.sub n 0` is `rfl`-equal to `n`, and `m₁ - 0 = m₁`/`(m₁ - 0) = m₁` close by `rfl` (so do not
+  carry a `Nat.sub_zero` cast when the index is literally `n - 0`).** This simplifies every full-consumption
+  roundtrip: `s₀ : Bytes (m₁ - (Suffix.empty m₁).remaining)` is **already** `Bytes m₁` (both projections reduce via
+  `rfl`), so `relRepeat_cast (Rel p) xs (Nat.sub_zero m₁) s₀` is usually unnecessary. But the *transparency* boundary
+  is a one-way trap: once you `unfold Suffix.empty` (turning it into the structure literal `{ remaining := 0, …​}`),
+  an already-bound `s₀ : Bytes (m₁ - (Suffix.empty m₁).remaining)` keeps the *abstract projection* `(Suffix.empty
+  m₁).remaining` while the goal's `prepend`/`splice` wants the *reduced* `{ remaining := 0 }.remaining` — the two are
+  not definitionally equal under that unfold, so `rw [prepend_apply]` then fails with the dependent motive error.
+  The fix: **do not unfold `Suffix.empty` by hand; close the `(Suffix.empty m₁).prepend s₀ = s₀` identity by
+  `apply Bytes.ext; intro i; simp [Suffix.prepend, Suffix.empty, splice, concat]`** (let `simp` unfold all four together,
+  which handles the projection atomically rather than splitting it).
+
+- 2026-10-22 — **`prepend_apply`/`splice_apply` introduce a `cast (congrArg Fin (splice_add (Nat.sub_le …​))).symm i`
+  index, and reducing it needs `rw [cast_fin_symm]` (the *full-index* form, which rewrites `cast (Eq.symm (congrArg Fin e))
+  i` to `⟨i.val, …​⟩`), **not** `cast_fin_val`/`cast_fin_symm_val` (the `.val`-only forms) — the `.val` forms fail with
+  a dependent-motive error because the surrounding `concat`'s `if h : ↑(cast … i) < m` scrutinee uses the full `Fin`
+  (its bound proof `h` feeds `s ⟨↑(cast … i), h⟩`).** After `rw [cast_fin_symm]` you get a leftover
+  `splice_add`/`Nat.sub_sub_self` arithmetic proof goal (`… = n`), closed by `omega`. Also: `cast (congrArg Bytes e) s =
+  cast (congrArg Bytes e') s` for two *different* proofs `e e' : n = m` is `cast_bytes_irrel e e' s`, but when the two
+  casts are *definitionally* the same term (e.g. `srel = cast (idx) sb` where `idx` is literally `hidx.symm`),
+  `rw [hsb']` closes the goal and a following `apply cast_bytes_irrel` is a no-goals error — remove it.
+
+- 2026-10-22 — **The whole-input roundtrip for a *padded* base (full-block `Run` + terminal tail) is the genuine
+  "one new proof" the design flags, and it turns on three transport facts that are each separately-provable but
+  must be *built*, not assumed:** (a) the block-prefix reconstruction `(Suffix.drop m (concat sbx stx)).prepend
+  sbx = concat sbx stx` (up to the `(m+t)-m = t` / `(m+t)-t = m` length casts via `Nat.add_sub_cancel_left/right`
+  and `Nat.sub_sub_self`), threading `s = concat sbx stx` → `bdrop_splice`/`concat_eq_splice` → `Suffix.ext`;
+  (b) the tail decode `decodeFull <tailElem> …` of the *remaining* `stx` (not the whole `s`), recovered by the
+  element-level `encode_rel`→`encodeRepeat_rel`→`relRepeat_cast` chain; (c) the `List.head?`-over-`filterMap`
+  selection needs the `filterMap` to be exactly `[result]`, i.e. `Unambiguous` of the block element *and* the
+  tail element (the `b64BlockDecodeFull_unambiguous`/`b64TailDecodeFull_unambiguous` pair).  Do not try to
+  shortcut around the `Suffix`/`Bytes`/`splice`/`prepend`/`cast` threading — it is the substance of the proof.
+
 - 2026-10-22 — **`termination_by` on a `where`-nested recursive proof must name the *helper's own* parameter, not the
   outer theorem's binder.** A `theorem f (bs) : … := exact go bs where go : (l : List α) → …` with `go` recursing
   three-elements-deep (`b0 :: b1 :: b2 :: t2 ↦ go t2`) needs `termination_by l => l.length` **inside `go`'s
