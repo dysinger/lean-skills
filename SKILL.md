@@ -484,6 +484,37 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-24 — **Stdlib `Nat` `<`-cancellation lemmas are `Classical.choice`-dependent; the `≤`/`=` forms
+  are clean.** `Nat.lt_of_mul_lt_mul_left`, `Nat.mul_lt_mul_left`, `Nat.lt_of_mul_lt_mul_right` all
+  `#print axioms` to `[propext, Classical.choice, Quot.sound]` (they route through `Decidable`-`by_cases`),
+  while `Nat.mul_le_mul_left`, `Nat.le_of_not_gt`, `Nat.lt_of_le_of_ne`, `Nat.succ_le_of_lt`,
+  `Nat.add_left_cancel`, `Nat.sub_add_cancel`, `Nat.sub_sub_self` are `[propext]`-or-less. **For an
+  axiom-gated law, `#print axioms <lemma>` *before* using any stdlib arithmetic lemma** — one `Classical.choice`
+  in a single `Nat` step silently pushes the whole theorem off the `[propext, Quot.sound]` gate, and only
+  `#print axioms <your theorem>` (not a green build) surfaces it. Replace `4*a < 4*b → a < b` with a tiny
+  `private theorem … (h : 4*a < 4*b) : a < b := by omega` — `omega` is constructive.
+- 2026-10-24 — **`omega` does not see field projections (`t'.hle`, `i.isLt`): surface them as explicit `have`s.**
+  `omega` only uses *local binder* hypotheses, so `t' : Suffix n` contributes no `t'.remaining ≤ n` and `i : Fin k`
+  contributes no `i.val < k`. Before `omega`, write `have hle : t'.remaining ≤ n := t'.hle` and
+  `have hi : i.val < k := i.isLt`. The trap is worse in a **theorem statement's** `(by omega : i.val + L < m)`
+  index annotation: that `omega` elaborates in the *statement* context (no `have`s in scope), so either inline
+  the facts (`(by have hi := i.isLt; have hle := t'.hle; omega)`) or drop the annotation and pass the index proof
+  as a named `(hidx : …)` parameter — the caller then closes the proof-term mismatch by proof irrelevance.
+- 2026-10-24 — **`omega`'s Int-model emits *spurious* "counterexample may satisfy the constraints" on Nat
+  subtraction inside a large context** (e.g. `m₁ + m₂ - t'.remaining` with `t'.remaining = 4·|rest|` and
+  `m₂ < t'.remaining`; the model lets `a - b` go negative, so its `a - b ≤ -1` constraint violates the real
+  `t'.hle`). Fix: don't hand `omega` the whole context with Nat-sub terms — first `rw` the equality hypotheses
+  *into the goal* (`rw [← hL, ← hm₁len]` is safe on a plain Nat inequality, since only the goal's occurrences are
+  rewritten), which leaves a clean `4*a < 4*b` / `4*a + 4 ≤ 4*b` fact, then finish with a minimal `omega` or a
+  constructive `Nat.mul_le_mul_left` step. (`rw [hL]` fails differently when `hL`'s LHS is itself a *type index* —
+  see the dependent-index entry below.)
+- 2026-10-24 — **`rw [hm₂ : m₂ = 0]` fails with a dependent-motive error when `m₂` occurs in the *type* of a
+  projection the goal mentions** — `t'.remaining` for `t' : Suffix (m₁ + m₂)`, even when the goal
+  `(m₁ + m₂ - t'.remaining) + 4 ≤ m₁` is a plain Nat inequality. `rw` abstracts `m₂` everywhere in the goal,
+  including inside `t'`'s type, and refuses. Use `simpa [hm₂] using t'.hle` (simp rewrites at the `Nat` level
+  without abstracting the projection's type) or assemble the arithmetic explicitly (`Nat.sub_add_cancel t'.hle`,
+  then `rw [h] at hsub`, then `Nat.add_left_cancel`) instead of `rw`-ing the equality.
+
 - 2026-10-24 — **Rewriting a *dependent* index (e.g. `bdrop (m₁+m₂-t'.remaining)`'s index) with `rw`
   [hrem]`/`rw [hk]` fails with "motive is not type correct"** — the `bdrop`/`concat` result *type*
   `Bytes (n - index)` depends on `index`, and `r`w` cannot abstract over the occurrence inside a projected
