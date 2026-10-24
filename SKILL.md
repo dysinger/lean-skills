@@ -484,6 +484,19 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-24 — **Extracting the *remaining bytes* of a `Suffix` from `t'.prepend s₀ = concat a b` yields a cast that
+  needs a *second* `hrem`-transport: `bdrop_prepend` gives `cast (congrArg Bytes (Nat.sub_sub_self t'.hle).symm)
+  t'.bytes : Bytes (m₁+m₂-(m₁+m₂-t'.remaining))`, not `Bytes m₂`.** `Nat.sub_sub_self t'.hle` and
+  `Nat.add_sub_cancel_left m₁ m₂` (from `bdrop_concat`) are *different* `Nat` equalities that only align after
+  `hrem : t'.remaining = m₂`; so the lemma's conclusion should be stated in the *natural* `bdrop_prepend` form
+  (`cast (congrArg Bytes (Nat.sub_sub_self t'.hle).symm) t'.bytes = cast (congrArg Bytes (by omega)) b`) and the *caller*
+  resolves the length transport with `hrem`, not the lemma. **Second gotcha:** `cases t'` on a `Suffix` does **not**
+  propagate into `s₀ : Bytes (m₁+m₂ - t'.remaining)`/`h : t'.prepend s₀ = …` — the projection `{remaining := m₂, hle :=
+  hle, bytes := bytes}.remaining` is *not* reduced to `m₂`, so a later `splice … s₀ …` type-mismatches (`Bytes (m₁+m₂ -
+  {remaining := m₂, …}.remaining)` `≠` `Bytes m₁`) and `subst m₂` fails (`b : Bytes m₂` is dependent). Prefer to prove the
+  *prefix* half (`prepend_concat_prefix_cast : cast (congrArg Bytes e) s₀ = a`, with `e : m₁+m₂-t'.remaining = m₁` passed
+  explicitly so the caller's `omega` carries `hrem`) via `Bytes.ext` + `prepend_apply` + `cast_fin_symm` (each `simp`
+  branch with the explicit `< m₁`/`≥ m₁` disproof), and derive the suffix half by `bdrop` rather than `cases` the `Suffix`.
 - 2026-10-24 — **`List.mem_iff_getElem : a ∈ l ↔ ∃ i h, l[i] = a` is the clean membership→`Fin`-index
   bridge (no `Classical.choice`).** To lift "`c ∈ a`" to "`c` is the `i`-th byte of the content-extraction
   `a = List.ofFn s`" (the pad-*presence* direction of an alphabet/pad-dichotomy proof, dual to the
