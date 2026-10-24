@@ -484,6 +484,30 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-24 — **Pinning a `relRepeat` run's *byte length* is a clean, generic induction:
+  `relRepeat (Rel elem) xs n s → n = width · xs.length` for an element that consumes a fixed `width` bytes per step.**
+  Prove it by `induction xs generalizing n`, then `rw [relRepeat_cons]`; the hypothesis gives `s₁ : Bytes m` with
+  `Rel elem x s₁`, so the element's length fact (`Rel_elem_len : Rel elem x s → m = width`) does `subst m`, the IH gives
+  `n - width = width · rest.length`, and the goal `n = width · (x::rest).length` closes by
+  `rw [List.length_cons, Nat.mul_add, Nat.mul_one]; omega` (omega cannot distribute `width · (|rest|+1)` on its own — feed
+  it `Nat.mul_add`/`Nat.mul_one` first). This is the *length half* of the block/tail split-uniqueness a padded-base
+  whole-input roundtrip needs (the width is 4 for base64 blocks/tails, 8 for base32).
+- 2026-10-24 — **Pinning a `Rel (iso i d) x s` value's *size* unfolds the Iso's `apply` through its internal match:
+  `Rel (iso blockIso (count k (satisfy p))) x s → x.length = 1 ∨ x.length = 2`** for a block `Iso` whose `apply` is
+  `match unapply-block with | some [b0] => some [b0] | some [b0,b1] => some [b0,b1] | _ => none` (a "tail" iso restricted to
+  short outputs). Proof: `rw [Rel_iso]` → `⟨a, ha, _⟩`, `change blockApply a = some x at ha`, `unfold blockApply at ha`,
+  `cases hb : <inner block apply> a with`, then `cases` the result list down; in the 1-/2-element branches `simp [hb] at
+  ha; cases ha; right/left; rfl` (the `cases ha` turns `some x = some [b0,b1]` into `x = [b0,b1]` so `.length` reduces).
+  This is the *content half* of the split-uniqueness argument: the tail value's arity is 1..k-1, the block value's is k.
+
+- 2026-10-24 — **Do not fabricate paper provenance for your own derived combinators; verify the source
+  actually defines them before writing "paper §X" in a docstring or README.** A faithful port adds
+  combinators *in the spirit of* the source, but the paper only defines `many` (§3.4) and `chainl1` (§6.1);
+  `sepBy`/`chainr1`/`optional`/`maybe`/`choice`/`count`/`manyUpTo` are the *port's own* additions and must be
+  labeled as such ("not in the paper"), not cited to a section (§6.2 is the paper's *Abstract Syntax*,
+  which defines no combinators at all). `grep` the source paper for each combinator name before citing it;
+  a reviewer will.
+
 - 2026-10-23 — **`decodeFull p h n s` is insensitive to a length cast of its byte argument, and this is a
   one-line lemma (`subst e; rfl`), not a long `splice`/`concat` chase.**
   `decodeFull_cast p h : ∀ {n m} (e : n = m) (s : Bytes n), decodeFull p h m (cast (congrArg Bytes e) s) =
@@ -494,6 +518,29 @@ names/paths); the specific repo lives elsewhere.
   st` result transfers verbatim. This is the clean *cast*-level transport the padded-base whole-input roundtrip needs,
   and it replaces fighting the dependent `Bytes` reindexing by hand.
 
+- 2026-10-23 — **`List.ext_getElem?` (the *total* `[i]?` form) is the fix for the `List.ofFn` content-extraction
+  grind: it closes `List.ofFn (splice hm s₁ s₂) = b :: List.ofFn s₂` cleanly, where `List.ext_getElem`*` (the
+  `getElem` form) left unclosable `omega` index-bound goals.** `Rel (count k (satisfy p)) xs s → List.ofFn s = xs`
+  *is* provable `[propext, Quot.sound]`-only without the `Functional` fallback: in the `succ` case, after `rw [hs]`
+  and `change List.ofFn (splice hm (single a.1) s₂) = a.1 :: List.ofFn s₂`, do `apply List.ext_getElem?; intro i;
+  simp only [List.getElem?_ofFn]` — this gives `(if h : i < n then some (splice … ⟨i,h⟩) else none) = (a.1 :: List.ofFn s₂)[i]?`
+  (both sides are *total* `Option`), so `by_cases hi : i < n` with each branch `simp [hi]` **and no length hypothesis to
+  discharge** (the `List.ext_getElem`/`getElem_ofFn` route demanded `n = n-1+1` per element). In the `i < n` branch split
+  again on `i < 1`: the `i = 0` sub-branch is `splice_prefix_read … ⟨i,hi⟩` then `subst i; simp`, the `i ≠ 0` sub-branch is
+  `splice_apply` + `unfold concat` + `rw [cast_fin_symm]` then `rw [List.getElem?_cons]` + `simp [show i ≠ 0 by omega]` — the
+  `[i]?` cons reduction needs `i ≠ 0` (not `¬ i < 1`) because `(a::l)[i]?` matches `getElem?_cons_succ` only when `i` is
+  syntactically `j+1`. The outer `¬ i < n` branch closes by `simp [hi]` + `omega` (the cons length `n-1+1 ≤ i`).
+- 2026-10-23 — **Unwrapping a `f bs = some ⟨n, s⟩` into per-component encodings needs `cases
+  (Option.some.inj h)`, not `congrArg Sigma.snd` — `Sigma.snd` is a *dependent* projection and `congrArg` over it is
+  ill-typed (yields `?m ⟨…⟩ = ?m ⟨…⟩`, expected `… ≍ …`).**  When `f bs` is a `match encodeRepeat … , encodeTail …` that
+  re-pairs into `some ⟨m₁+m₂, concat sb st⟩`, mimic `encodeB64`/`encodeB64'`: after `unfold`/`cases` on the two
+  `encodeRepeat …`/`encodeTail …` scrutinees (using `cases heb : …` to keep the *hypotheses* `heb`/`het` named), build
+  `he' : some ⟨m₁+m₂, concat sb' st'⟩ = some ⟨n, s⟩` by `simpa [heb, het] using he` (give the Sigma an explicit type
+  annotation `(… : Sigma fun k => Bytes k)` or `⟨⟩` fails to infer), then `have hge := Option.some.inj he'` and
+  `cases hge` — this yields `rfl` for the length (`m₁+m₂ = n`) and a `HEq` for the bytes (`concat sb' st' ≍ s`), exactly
+  the two facts you need, with no dependent-`congrArg` gymnastics. **Do not** `simp [heb, het] at he` (it rewrites the
+  in-scope `heb`/`het` into `some ⟨…⟩ = some ⟨…⟩` and then the goal's `encodeRepeat … = some ⟨…⟩` conjunct no longer
+  matches them).
 - 2026-10-23 — **`Functional` (one value → at most one `⟨n, s⟩`) is the clean way to *pin content*, and it
   avoids `List.ofFn`/`Fin`-cast index arithmetic entirely.**  `Functional d : ∀ x n₁ n₂ s₁ s₂, Rel d x s₁ → Rel d x s₂
   → ⟨n₁,s₁⟩ = ⟨n₂,s₂⟩`. So given `Rel d x s`, get `hne : encode d x ≠ none` via `encode_ne_none`, `cases he :
