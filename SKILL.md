@@ -484,6 +484,16 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-24 — **`List.mem_iff_getElem : a ∈ l ↔ ∃ i h, l[i] = a` is the clean membership→`Fin`-index
+  bridge (no `Classical.choice`).** To lift "`c ∈ a`" to "`c` is the `i`-th byte of the content-extraction
+  `a = List.ofFn s`" (the pad-*presence* direction of an alphabet/pad-dichotomy proof, dual to the
+  `List.ext_getElem?` content-extraction direction): `rcases List.mem_iff_getElem.mp hc with ⟨i, hi, hi'⟩` gives
+  `hi : i < (List.ofFn s).length` and `hi' : (List.ofFn s)[i] = c`; then `c = s ⟨i, Nat.lt_of_lt_of_eq hi
+  List.length_ofFn⟩` closes by `hi'.symm.trans (List.getElem_ofFn hi)` (or the clean hand-proved
+  `(List.ofFn f)[i] = f ⟨i, Nat.lt_of_lt_of_eq h List.length_ofFn⟩` variant — see the `ofFn`-bridge `Classical.choice`
+  entry). `Nat.lt_of_lt_of_eq hi List.length_ofFn` is the canonical `i < |List.ofFn s|` → `i < n` transport. This
+  is how you show a `Rel (iso i (count k (satisfy p))) x s` string *contains* a sentinel byte (e.g. a `=` pad) from
+  the iso's `apply` forcing a sentinel at a terminal position — the pad-dichotomy's tail side.
 - 2026-10-24 — **Pinning a `relRepeat` run's *byte length* is a clean, generic induction:
   `relRepeat (Rel elem) xs n s → n = width · xs.length` for an element that consumes a fixed `width` bytes per step.**
   Prove it by `induction xs generalizing n`, then `rw [relRepeat_cons]`; the hypothesis gives `s₁ : Bytes m` with
