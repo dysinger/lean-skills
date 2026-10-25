@@ -1560,7 +1560,71 @@ own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-
   (`(List.ofFn f)[i] = f ⟨i, Nat.lt_of_lt_of_eq h List.length_ofFn⟩` by `induction n` +
   `Fin.foldr_succ`/`getElem_cons_zero`/`getElem_cons_succ`).
 
+- 2026-10-26 — **`Bytes n := Fin n → UInt8` equality needs `funext`, so `decide` can NEVER
+  close a `Bytes` goal — and that silently makes "write a concrete expected value" proofs look
+  impossible. The fix is `Bytes.ext` + one `rfl`/`decide` per index, NOT a better simp set.**
+  Writing value-assertion tests for a concrete encoder (`example : encode v = some ⟨4, f⟩ := by
+  decide`) fails with "`Decidable` instance did not reduce" — the `instDecidableEqBytes` instance
+  bottoms out in `Nat.decidableBallLT` over `Fin`, which cannot see through the function. Two
+  further traps hide behind it: (1) `decide` on a *`Bytes` index* after `intro i` fails with
+  "Expected type must not contain free variables"; (2) `Bytes k` literals styled
+  `fun i : Fin k => [a,b,c][i]` compare fine, but only index-by-index.
+  The working shape (8 lines, closes with zero surprises):
+  ```lean
+  example : encode v = some ⟨4, fun i : Fin 4 => [0x5A,0x67,0x3D,0x3D][i]⟩ := by
+    rw [encDef, splitDef]           -- reduce to the block/tail composition
+    simp only [...the element defs...]
+    refine congrArg some ?_
+    apply Sigma.ext
+    · rfl
+    · apply heq_of_eq
+      apply Bytes.ext
+      intro i
+      match i with
+      | ⟨0, _⟩ => rfl | ⟨1, _⟩ => rfl | ⟨2, _⟩ => rfl | ⟨3, _⟩ => rfl
+  ```
+  **Do not try to generalise this into a `macro "…" : tactic`** — a tactic macro's
+  ``` `(tactic| …) ``` body does not see the `i` introduced by the caller's `intro i`, so the
+  trailing `match i with` arms fail or the goal is reported unsolved. Keep it inline
+  per-example to generate from a script, and keep the `simp only` list **per-shape**: an
+  over-broad list produces `linter.unusedSimpArgs` warnings on the shapes where a branch is
+  unreachable (multi-block inputs never reach the tail), which breaks a zero-warning gate.
+  Scope the linter off at file level with `set_option linter.unusedSimpArgs false`
+  (`set_option … in` only scopes ONE declaration, so it does not help a run of examples).
+
+- 2026-10-26 — **`dsimp only []` is NOT always a no-op; "remove the no-op" can break the proof.**
+  A cleanup ticket called `dsimp only []` a no-op, but deleting it made a later `rw` fail
+  "did not find an occurrence of the pattern". `dsimp only` with an empty list still performs
+  beta/iota/zeta reduction — here it unfolded the `Option`/`Sigma` wrapper so the goal was
+  stated in the `(n - t.remaining) + t.remaining` / `concat s₀ t.bytes` form the next step
+  matched. Before "cleaning up" any `dsimp`/`simp only []`, delete it and recompile; if a
+  later step stops matching, it was load-bearing — then replace it with an explicit
+  `dsimp only` plus a comment saying why, rather than restoring an opaque `[]`.
+
+- 2026-10-26 — **Turn an axiom-discipline invariant into a build-enforced `#guard_msgs` gate;
+  it is cheap, and it is the only thing that stops a silent `Classical.choice` regression.**
+  `#guard_msgs in #print axioms foo`, preceded by a `/-- info: 'Foo.foo' depends on axioms:
+  [propext, Quot.sound] -/` comment, pins the *exact* diagnostic text: any axiom that appears
+  or disappears changes the message and fails compilation. Two layout rules matter:
+  (1) the `info:` doc comment must be **immediately** before `#guard_msgs in` — putting an
+  ordinary `/-- … -/` docstring in between gives "unexpected token '/--'";
+  (2) a `lean_lib` holding only these needs `roots := #[`GateName]` **and**
+  `@[default_target]` on it, or plain `lake build` will not compile it (a non-default lib is
+  only built when named). Generate the file from a script over the law list so it stays
+  complete; verify BOTH failure directions (wrong expected text, and a law whose axioms
+  change) before trusting it.
+
 ## Changelog
+
+- 2026-10-26 — **Three lessons from turning a hand-checked axiom discipline into a build gate
+  and writing concrete encoder value-tests.** (a) `Bytes n := Fin n → UInt8` equality needs
+  `funext`, so `decide` can never close a `Bytes` goal — use `Bytes.ext` + per-index
+  `match i with ⟨k, _⟩ => rfl`, and do not try to hide it in a tactic macro (the macro body
+  cannot see the caller's `intro i`). (b) `dsimp only []` is not always a no-op: it performs
+  beta/iota/zeta reduction, and deleting one can break a later `rw`. (c) `#guard_msgs in
+  #print axioms` + an immediately-preceding `info:` doc comment pins a law's exact axiom set,
+  turning `[propext, Quot.sound]`-only into a compile-time failure; the gate lib needs
+  `@[default_target]` or plain `lake build` skips it.
 
 - 2026-10-25 — **A whole-input decoder with a multi-block terminal tail breaks the
   decode→encode converse; fix it with a `length ≤ 1` guard (not a single-element re-shape),
