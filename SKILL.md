@@ -484,6 +484,15 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-27 — **`decide_eq_true (by omega)` on a *disjunction* leaks `Classical.choice` — `omega` closes a `∨` by case analysis (trichotomy), so building the disjunct explicitly is the fix.** `#print axioms` on `theorem t (n : Nat) (h : 65 ≤ n ∧ n ≤ 70) : decide ((48 ≤ n ∧ n ≤ 57) ∨ (65 ≤ n ∧ n ≤ 70)) = true := decide_eq_true (by omega)` reports `[propext, Classical.choice, Quot.sound]`, while `decide_eq_true (Or.inr h)` on the same goal is clean. `decide` is not the problem — the *disjunctive* proof handed to it is. This is the same `Nat.lt_or_gt_of_ne`/trichotomy family as the earlier `omega`-disjunction entry, but the composition trap is far more common and is easy to miss because the goal looks like plain arithmetic: **rule — in a `Classical.choice`-gated law, never hand `omega`/`by_contra`/`decide_eq_true` a disjunctive goal; build the disjunct with `Or.inl`/`Or.inr` and let `omega` close only the conjunctive/arithmetic leaf.**
+- 2026-10-27 — **A `match`/`if` on a `Bool` *in the goal* (with `h : b = true` in context) is a dependent match: `subst h; rfl` and `cases b` both fail.** The symptoms are "`rfl` failed: the left-hand side `match true, ⋯` is not definitionally equal to …" and, for `cases`, "Dependent elimination failed". Neither is a `Classical.choice` leak — it is the motive mentioning the discriminee. Fix: `cases b <;> simp_all`, or restate so the match is not dependent (move the discriminee into a hypothesis), or prefer `if h : p then` to keep the fact in the branch. Recorded separately from the leak catalogue because the *fix* is different: no axiom problem, just a motive problem.
+- 2026-10-27 — **`if_pos`/`if_neg` are deprecated in favour of `ite_eq_left`/`ite_eq_right` — and the replacements are *applied*, not `rw`-able and not `Iff`s.** Both halves are deprecated (not just `if_neg`), so a repo-wide `if_pos`/`if_neg` habit emits warnings that a `-DwarningAsError` gate turns into build failures. The shapes are `ite_eq_left : c → (if c then t else e) = t` and `ite_eq_right : ¬c → … = e` — functions of a proof argument. Write `exact ite_eq_left h` or `rw [show (if P then a else b) = a from ite_eq_left h]`; `rw [ite_eq_left]` bare and `.mpr` **do not work** (no `Iff` projection to take).
+- 2026-10-26 — **When a proof refuses to compile and you want a clean slate, never `git stash`/`git reset`/`git checkout --` the file — move the broken *theorem* to a `sorry` instead, so the library still builds and you can iterate in a scratch file.** Debugging a hard lemma, the library is unbuildable, so `lake env lean` on a scratch probe fails too ("olean does not exist") — which tempts a "revert and start over". Reverting broadly destroys verified sibling work (it did, mid-session). The cheap, safe move is to stub the one declaration (`:= by sorry`), let `lake build` go green, then iterate the real proof in `/tmp/probe.lean` against the built library — with `sorry` you also get the *goal state* printed, which is usually the fastest way out. Commit incrementally (one base / one law family per commit) so a revert is never tempting.
+- 2026-10-26 — **`simp [f] at h` where `f` matches on a list *nested one level deeper* than `h` shows will leave an unreduced `match` — `rcases` the list down to a concrete length first.** `b32TailUnapply (v0 :: w :: r2) = some a` reduces only after `r2` is known to be `[]`/`[_]`/`[_,_]`, because the `def`'s match covers 1–4-element lists; `simp only [unapply, blockUnapply, Option.some.injEq] at h` then `subst h; rfl` per arm is the reliable pattern, and the *impossible* arms (5+ elements) reduce to `none = some a` and close by `simp [unapply] at h` alone. Also: a `simp` argument reported "unused" in one arm is usually needed in the *other* arms — don't delete it globally, delete per-arm, or you trade a warning for a compile error.
+- 2026-10-26 — **Generalising a "named vector" rejection proof to a *for-all* law: the arity case is free once you have the two region-length lemmas — `n = k·(|a| + |b|)`, then `Nat.mul_mod_right`.** A queue item billed as "the only genuinely hard one" (`n % 4 ≠ 0 → decode s = none`, for a decoder that splits into a *repeat run* plus a *terminal element*) needed no case-split over examples: the run-length lemma gives `n - t.remaining = k · blocks.length`, the tail-length lemma gives `t.remaining = k · tails.length`, the two regions partition `n` (needs the suffix's own `≤` witness, **not** just the equations — `omega` stalls without it), so `n = k · (blocks.length + tails.length)` and `rw [hn, Nat.mul_mod_right]` closes. Corollary worth checking *before* assuming difficulty: `omega` **cannot** derive `n % 4 = 0` from `∃ k, n = 4 * k` — it does not reason modulo; always convert to the equational form and rewrite.
+- 2026-10-26 — **"Invalid byte at *any* index" generalises cleanly by proving *every consumed byte* satisfies the (weaker) alphabet-or-pad predicate, then splitting the index on the region boundary — do not try to re-index into the run.** For a whole-input decoder = *run of an alphabet-only element* then *a padding-capable terminal element*, `∀ i : Fin n, OrPad (s i) = true` follows from: `relRepeat_forall` on the run (each block byte is `Char`, hence `OrPad`), the terminal element's own `count k (satisfy OrPad)` window for the tail region, and a `by_cases i.val < n - t.remaining` split. The tail-region read is the only fiddly part; **`bdrop_prepend`** (`bdrop (n - t.remaining) (t.prepend s₀) = cast … t.bytes`) gives it in one step — far cheaper than re-deriving `splice_suffix_read`. A useful bonus: this single lemma subsumes a whole family of "byte at index k is bad" vectors.
+- 2026-10-26 — **For "a `=` may only appear at position ≥ 2 of the padded block", enumerate the block-encoder's *value shapes* (1/2 or 1/2/3/4 bytes) — and remember the 1-byte shape's slot 1 is an alphabet char, not the pad.** A tail-block window is `[c₀, c₁, =, …]` (`[c₀, c₁, c₂, =]`, etc.); slots 0 and 1 are always `valToDigit` outputs (`valToDigit_not_pad`), and the pad run starts at slot 2 in *every* shape including the 1-byte one (whose window is `[c₀, c₁, =…]` — slot 1 is still `valToDigit`). Getting this wrong in a comment ("slot 1 is the pad in the 1-byte shape") sends the proof chasing an unreachable case; the goal state (`hi : s ⟨1,·⟩ = 61` alongside `hsl : some [c₀, c₁, 61, …] = some a`) is what corrects you. Practical shape: prove two small `have`s — slot 0 is `valToDigit (v0 / k)`, slot 1 is `valToDigit (…)` for the 2+-byte shapes and the 1-byte shape's own second char — each by `rcases`-ing the tail list to concrete lengths and `simp only [unapply, blockUnapply, Option.some.injEq] at h; subst h; rfl`. The 5+-byte arm closes with `simp [unapply] at h` alone (`none = some a`).
+- 2026-10-26 — **`rw`/`congrArg` on an index *into* a `bdrop`/`concat` result fails with "motive is not type correct" when the index's `Fin` proof is `omega`-generated — compare *values* instead, or `dite`-normalise, never rewrite the index.** Reading `(bdrop m s) ⟨k, _⟩` and wanting `s ⟨k + m, _⟩` needs an equality of `Fin`s whose second components are unreconcilable `omega` proofs; `rw [hidx] at hc` then fails on the motive. Two shapes that work: (a) build the equality with `congr 1; exact Fin.ext (by simp; omega)` (replace both sides by the same *value*-indexed term, let proof irrelevance handle the rest); (b) `simp only [cast_bytes_val_symm]` to strip a `Bytes` length cast, then `congr 1` + the `Nat` arithmetic lemma (e.g. `Nat.sub_sub_self`). Useful invariant: if a residual `cast ⋯ t.bytes` survives your rewrites, the two `fst`s are not syntactically equal and you are fighting the wrong shape.
 - 2026-10-25 — **A *dependent* `cases`/`match` on a list whose **equation** (not a bound) sits in the context is itself a `Classical.choice` leak — restate the hypothesis by *number* (`≤`/`<`) before matching.** Proving `exists cs, unapply bs = some cs` with the hypothesis `bs.length = 1 ∨ bs.length = 2` in scope and `match bs with | [v0] => … | [] => simp at h`, the proof term goes through `Eq.ndrec`/`noConfusion` (the `match`'s motive mentions `bs`), and `#print axioms` reports `Classical.choice` **even though every lemma you cite is `[propext]`-clean and the same proof with no hypothesis at all is clean**. Swapping the disjunctive equation for numeric bounds — `(hlen : 1 ≤ bs.length) (hlen2 : bs.length ≤ 2)`, then `match bs, hlen, hlen2 with` — makes the elimination non-dependent and the law `[propext, Quot.sound]`-only again. Diagnostic shape to remember: `#print axioms` says `Classical.choice`; bisect the *skeleton* (drop the body to `⟨_, rfl⟩`) and it still leaks ⇒ the leak is in the `match`/`cases`, not the arithmetic. Corollary: the same trap hits `Partial`-style length hypotheses `ds.length = k`, so **derive** the index from the term (`count ds.length …`, not `count k …` plus `ds.length = k`) rather than threading an abstract `k`. The general rule unifying all the `Classical.choice` entries in this file: a hypothesis whose *type mentions* the variable you are about to eliminate makes that elimination dependent, and dependent elimination reaches `Decidable`/`noConfusion` machinery that is not axiom-free.
 - 2026-10-25 — **"Unique canonical inverse"-style requirements are usually *two already-proved laws and nothing else* — state the iff and assemble, do not re-derive.** A spec sentence like "decode succeeds exactly on the encoder's image" reads like new work, but if you already have `decode s = some v → encode v = some ⟨n,s⟩` (converse) and `encode v = some ⟨n,s⟩ → decode s = some v` (roundtrip), then `decode s = some v ↔ ∃ w, encode w = some ⟨n,s⟩ ∧ v = w` is `⟨v, conv …, rfl⟩` one way and `rw [hv]; exact roundtrip w he` the other. Two traps: (a) `rintro ⟨w, he, rfl⟩` **fails** — substituting the *value* equation with `rfl` in the pattern does not rewrite the existential body's bound occurrences; use `rintro ⟨w, he, hv⟩; rw [hv]; exact roundtrip w he`; (b) `subst hv` on `hv : v = w` **eliminates `w`**, so a later `roundtrip w he` errors with "unknown identifier `w`" — `rw` rewrites the goal without clearing the binder. When a queue says "mostly assembly", check for these two first; they cost far less than a re-derivation.
 - 2026-10-25 — **A "converse" law can be *true and proved* while the *injectivity* (or any sibling) law you ship is silently weaker than the spec — audit each statement against the spec sentence, not against "it compiled".** Concretely: a spec says "`encode v = encode v'` ⇒ `v = v'`" (equality of the two `Option` results), and the theorem is proved as "`encode v = some ⟨n,s⟩` ⇒ `encode v' = some ⟨n,s⟩` ⇒ `v = v'`" (two success hypotheses). That is *strictly different*: it cannot be applied to the `none = none` branch, and the bridge between the two forms is `encode` is **total** — which, if never proved, makes the shipped law quietly conditional on an unstated fact (and a docstring that then says "partial bijection" is overstating). Two honest fixes: (a) prove `encode v ≠ none` and restate as the spec's `Option`-equality form, splitting the `some/some` case to the existing proof and refuting `none`/mixed by totality; or (b) amend the spec Scenario to say "both `= some ⟨n,s⟩`" **and** state the totality lemma beside it. Rule: for every law, put the spec sentence and the Lean statement side by side and check they are the *same* Prop, not merely both true. A green `#print axioms` and a green build say nothing about this.
@@ -2120,3 +2129,108 @@ own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-
   indexed-inductive vs structural-`def` `Rel`, Repr/`#eval` ergonomics,
   `-!` doc-after-import rule, `@`-notation for instance-implicit patterns,
   stored-instance recovery in `match`, IH argument order under `induction`.
+
+- 2026-10-26 — **`example : ∀ (n : Nat) …, … := fun n s v => …` trips `linter.unusedVariables`
+  on the *statement's* binder; renaming it `_n` then breaks the body.** When a bench/gate file
+  holds `example`s that just re-export a quantified library law, the `∀`-in-the-type spelling is
+  wrong on two counts: the linter wants `n` "unused" because it only appears inside the type,
+  and `_n` makes `⟨n, s⟩` in the proof term unbound. Write the *explicit-binder* form instead —
+  `example (n : Nat) (s : Bytes n) (v : List UInt8) : <prop> := Law s v` — which is also what
+  every other example in such files uses. Zero-warning gates make this a hard failure, not a nit.
+
+- 2026-10-26 — **A `_char`-style iff over a *canonical value type* is the way to make a
+  "the type forbids X" claim provable instead of rhetorical.** If you have `inductive V` with
+  terminal constructors (tails with no continuation) plus `bytesOf : V → List UInt8` that is a
+  proved bijection (`ofBytes_bytesOf` / `bytesOf_ofBytes`), then
+  `decode s = some v ↔ ∃ w : V, encode (bytesOf w) = some ⟨n,s⟩ ∧ v = bytesOf w`
+  follows by pure assembly from the `List UInt8` characterization (`V`-intro via `ofBytes`,
+  `V`-elim via `bytesOf`). Proof recipe: `rw [listChar]`, then
+  `· rintro ⟨v', he, hv⟩; exact ⟨ofBytes v', by rw [bytesOf_ofBytes]; exact he, by rw [bytesOf_ofBytes]; exact hv⟩`
+  `· rintro ⟨w, he, hv⟩; exact ⟨bytesOf w, he, hv⟩`.
+  Add the companion `…_spine : decode s = some v → ∃ w, v = bytesOf w` (same `rw` at `h`, then
+  `⟨ofBytes v', by rw [hv, bytesOf_ofBytes]⟩`). Terminality itself is `rfl`
+  (`bytesOf (tail1 b) = [b]`) and depends on **no** axioms, so gate it separately.
+
+- 2026-10-26 — **When a task offers "prove X" versus "keep the withdrawal of X", check whether
+  X is already true structurally and merely unconnected.** A ticket here read "either prove a
+  type-level `B64` that cannot represent trailing data (currently it's a bijective relabeling, so
+  'unrepresentable' is false by construction), or keep the withdrawal." Both branches were based
+  on a conflation: *being a bijection with `List UInt8`* does not make a type unconstrained —
+  every list still maps to a terminal-tail spine, and that *is* the constraint. The missing piece
+  was a theorem connecting the type to the decoder, not a new type. Before accepting a
+  prover's dichotomy, grep whether the "forbidden" shape already has no inhabitant, and whether
+  any `decode`↔type theorem exists. The docstring saying "this is not a type-level fact" is a
+  claim to *verify*, not evidence — it may be a self-fulfilling note beside an unused type.
+
+- 2026-10-26 — **Repairing a stale handoff: keep a *forward-looking* instructions file separate
+  from session history, and never let a task file define its own change's scope.** Two concrete
+  failures to avoid when maintaining an `AGENTS.md`-style ledger: (1) appending
+  `## Session status: X DONE` sections produces a file where the top of the page and the bottom
+  contradict each other (different `HEAD`s, different task counts) — history belongs in the
+  change ledger / changelog, and the instructions file should state one "current state" block plus
+  "where the truth lives" (one authoritative file per question). (2) A comment in `tasks.md`
+  saying "§N is out of scope for this change, create a separate change" is **not** authority —
+  the `proposal.md` is. Check the proposal before deferring work: here it stated the deferred
+  goal verbatim as the change's own Why, so the split was circular and had to be withdrawn.
+
+- 2026-10-26 — **"Relax the law" is almost always the wrong fix; move the quotient into the
+  *object* instead.** When a strict isomorphism `Iso α β` (`law : ∀ a b, apply a = some b ↔
+  unapply b = some a` as a *field*) cannot express a format that accepts several spellings of
+  the same value (case-insensitive hex, whitespace-insensitive text), the tempting fix is a
+  weakened law "modulo equivalence classes". Rejected — that re-introduces exactly the prose
+  invariant a field-law exists to abolish, and forces every downstream theorem to be restated.
+  The correct move: `norm : S → S` total + idempotent, and reify the quotient `S/~` as the
+  *subtype of `norm`'s fixed points*:
+
+  ```lean
+  structure Normal (S : Type) (norm : S → S) where
+    raw   : S
+    fixed : norm raw = raw
+  def fill (nz : Normalizer S norm) (s : S) : Normal S norm := ⟨norm s, nz.idem s⟩
+  theorem fill_fixed (nz) (s) : norm (fill nz s).raw = (fill nz s).raw := (fill nz s).fixed  -- rfl!
+  ```
+
+  `Iso α (Normal S norm)` is then an *ordinary* `Iso`, so every existing law applies verbatim,
+  and `drop ∘ fill = id` is the fixed-point witness (a `rfl`, **no axioms** — only
+  `fill_surj`/`fill_inj` need `[propext]`). Prove `fill_surj (nz) (f) : fill nz f.raw = f`
+  too, or "the subtype faithfully reifies the quotient" is asserted, not shown.
+
+- 2026-10-26 — **Put `norm` in the structure's *parameters*, not its fields.** With
+  `structure Normalizer (S : Type) where norm : S → S; idem : …` the type `Normal S nz.norm` is
+  opaque at the type level and **every** lemma needs a cast (and `fill nz s` stops being
+  `Normal S norm`). With `structure Normalizer (S : Type) (norm : S → S) where idem : ∀ x,
+  norm (norm x) = norm x`, `Normal S norm` and `fill nz s` share one definitional function and
+  `fill nz s : Normal S norm` typechecks directly. Never take the idempotence proof as a
+  *function argument* (`fill (h : ∀ x, …) s`) either: then behaviour depends on which witness a
+  caller supplies, so two callers get only propositionally-equal results.
+
+- 2026-10-26 — **A lossy direction is a wrapper OUTSIDE the `Iso`, and the theorem it owes has a
+  precondition people forget.** `decodeNormal i nz s := i.unapply (fill nz s)` is the
+  case-folding decoder: not an `Iso`, no inverse, accepts input the `Iso` rejects. The
+  useful law is **not** `drop ∘ fill = id` but
+  `hfix : norm s = s → i.apply x = some ⟨s, hfix⟩ → decodeNormal i nz s = some x`,
+  where `norm s = s` means *the encoder emits a normal form*. Without that hypothesis the
+  statement is **false**: normalising before `unapply` can consume input the strict `Iso`
+  accepted, so the wrapper fails on the encoder's own output. State it as a per-codec
+  obligation. Corollary for ordering: choose the fold direction so the canonical output is
+  already a fixed point — folding hex `a–f` **up** to `A–F` when the encoder emits uppercase,
+  never down.
+
+- 2026-10-26 — **A lemma that fails as one equation usually needs a case split, not a cleverer
+  tactic.** `hexToNibble (foldByte b).toNat = hexToNibble b.toNat` is unprovable as stated: in
+  the non-folded branch it demands `hexToNibble b.toNat = b.toNat`, false for any non-digit.
+  Three attempts died unifying 3 branches (digit `48..57` = fixpoint & equal; upper `65..70` =
+  fixpoint & equal; lower `97..102` = folds to `−32`, nibble equal by the digit lemma). Split
+  first. Related traps hit in the same sitting: `omega` cannot see `b.toNat < 256` — supply
+  `UInt8.toNat_lt b` explicitly before any `n / 16 ≤ 15` goal; `UInt8.toNat_ofNat'` +
+  `Nat.mod_eq_of_lt` is the bridge from `⟨n⟩` to `n`; `rw [List.map_cons, List.map_cons,
+  List.map_nil]` (one `map_cons` **per element**) beats `simp` here; and `private` lemmas in the
+  file you are extending need the bridge inlined.
+
+- 2026-10-26 — **Naming: don't import text-world or overloaded vocabulary into a byte-level
+  library.** For the quotient above, `Formatted` was wrong twice over (it names the *output* of a
+  formatter, and it drags in the paper's `String`/`Char` world inside a library whose units are
+  `UInt8`), and `Canonical` collides with an existing, different meaning in the same repo ("the
+  encoder emits exactly one spelling"). `Normal`/`Normalizer` wins: it is the term of art for a
+  rewriting system's normal forms, it is unused in the project, and `fill`/`normal` read
+  naturally against it.
