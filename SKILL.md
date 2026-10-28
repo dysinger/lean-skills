@@ -473,14 +473,20 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
    change the IR cannot express (`WellFounded.fix` threads a higher-order `ih`;
    it is backtracking search, not a tail loop).
 
-**Step 0 — before any of the above: is the *recursion scheme* the cost?** A
-definition built on `WellFounded.fix` (or any `Acc`-based measure) re-enters the
-recursion machinery per element and does **not** compile to a loop. Re-expressing
-it as structural recursion over a length index or a cursor changes no
-specification, needs no new trust, and has been measured at **588×** on
-otherwise-identical definitions. This is a *source-level* fix, cheaper than every
-layer above, and it is easy to miss because the function still "works" and is
-axiom-clean. Do this check first; only then reach for the carrier swap.
+**Step 0 — before any of the above: decompose, then ask whether the *control
+flow* is the cost.** Time the components in isolation before rearchitecting
+anything: a super-linear composite whose *parts* are linear means the cost is in
+how they are composed, not in any one of them. The most common shape is a
+**search where a single pass would do** — e.g. a decoder that re-invokes itself
+over the whole remaining input at every level (Θ(n²) work) when one pass would
+suffice. Measured: 91,382 µs vs 176 µs, 519×, with identical results.
+
+Do **not** start from "the recursion scheme must be it". Re-expressing a
+`WellFounded.fix` definition with `termination_by` is a **no-op** — Lean
+elaborates both to the same well-founded recursion (measured: 0.5% difference).
+That rewrite changes no codegen and no specification, so it is never the answer to
+a performance question. Only after decomposition rules out the parts should you
+reach for the carrier swap in step 1.
 
 **The rule:** measure *what actually costs* (the recursion scheme, then the result
  allocation, and only then the byte loop) before choosing a layer; pick the
@@ -494,7 +500,7 @@ axiom-clean. Do this check first; only then reach for the carrier swap.
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
-- 2026-10-28 — **`WellFounded.fix` on a dependent `Sigma`/`InvImage.wf` measure does NOT compile to a loop — an equivalent *structural* recursion can be hundreds of times faster, so measure before assuming "termination machinery is free".** Two functions computing the same relation over the same carrier, one def'd by `WellFounded.fix (InvImage.wf (fun x => x.1) Nat.lt_wfRel.wf) …` and one by a plain `foldr`/structural recursion over the length index, differed by **588× at n=4096** (measured on the emitted native binary, identical inputs, bit-identical results). `WellFounded.fix` is `Acc`-based well-founded recursion threaded through a higher-order `ih`; the compiled code re-enters the recursion machinery per element instead of running a loop. **Rule: prefer structural recursion (on a length/fuel index, or a cursor) whenever it exists; reach for `WellFounded.fix` only when no structural descent is available.** If you need `WellFounded.fix` for a totality proof, consider (a) a structural *definition* plus a separate `…_eq` bridge to the well-founded spec, or (b) a structural "fuel" argument you show is sufficient. Symptom that points here: the cost is super-linear in `n` even though each step is O(1), and the profile shows no obvious allocation site. Corollary: the same applies to `partial`-free total definitions — "it builds and is axiom-clean" says nothing at all about its speed.
+- 2026-10-28 — **A "fast structural rewrite" of a slow function was measured as a NO-OP — because `termination_by` elaborates to the *same* well-founded recursion. Attribute before you rewrite.** A function defined by `WellFounded.fix (InvImage.wf (fun x => x.1) Nat.lt_wfRel.wf) …` looked like the obvious culprit for a 500× slowdown (its emitted IR really does contain `lp_WellFounded_fixC…` and allocates a closure per level). Rewriting it with `termination_by n _ => n` + `decreasing_by` changed the time by **0.5%** (93,691 µs vs 94,137 µs at n=4096): Lean compiles the structural-looking form to the same `WellFounded.fix` machinery, so it is not even a codegen change. The real cost, found by decomposition, was **algorithmic**: the function was a backtracking *search* re-invoking a decoder over the whole remaining buffer at every level (Θ(n²) work), where a single-pass fold over the same helper did 519× better (176 µs). **Lesson — decompose before you rearchitect:** time the components in isolation (here: all n `decode` calls in a plain loop = 140 µs; `.attach` = nil; building the result list = nil; the composite = 91,382 µs). If the parts are cheap and the whole is not, the cost is the *control flow between* them, and no amount of definition-style rewriting will touch it. Corollary, for `@[extern]`/IR snooping generally: seeing scary-looking machinery in the emitted C is not evidence that it costs anything — measure that layer too. Corollary 2: `termination_by`-structural and `WellFounded.fix` are the *same* thing; do not present the former as an optimization.
 - 2026-10-28 — **Measuring Lean performance has three traps that all report `0 us` or a plausible-but-wrong number; force the value or you measured nothing.** (1) **`lake env lean file.lean` *interprets*** — it does not compile, and a `main` defined there **does not run at all**, so timings from it (or from `#eval` on a large computation) are meaningless; you need a real `lean_exe` (`lakefile.lean`: `lean_exe foo where root := \`Foo`) and run the built binary. (2) **Dead-code elimination**: if you time `(f x).length` or `(g x).1`, the compiler can compute only the length/index and elide the payload — a function that *should* take seconds reports `0 us` while printing a correct-looking answer. Force the whole value through a returned tuple, e.g. `let (out, dt) ← timeBatch 1 fun _ => f x` where `timeBatch` returns `(α × Nat)`, exactly the shape a bench harness should have. (3) **A warm-cache first call is not a measurement**, and neither is one run — batch `reps` and divide, and sanity-check by scaling `n` (a clean 4× time for 2× size means Θ(n²), which is usually a bug, not a constant factor). **Acceptance test: if any of your lanes reports `0 us`, treat it as "not measured" and fix the forcing — never as "instant".** Corollary: an A/B must differ in *exactly one* dimension; hold the types, the helpers, and the input identical, so the delta is attributable.
 - 2026-10-27 — **`decide_eq_true (by omega)` on a *disjunction* leaks `Classical.choice` — `omega` closes a `∨` by case analysis (trichotomy), so building the disjunct explicitly is the fix.** `#print axioms` on `theorem t (n : Nat) (h : 65 ≤ n ∧ n ≤ 70) : decide ((48 ≤ n ∧ n ≤ 57) ∨ (65 ≤ n ∧ n ≤ 70)) = true := decide_eq_true (by omega)` reports `[propext, Classical.choice, Quot.sound]`, while `decide_eq_true (Or.inr h)` on the same goal is clean. `decide` is not the problem — the *disjunctive* proof handed to it is. This is the same `Nat.lt_or_gt_of_ne`/trichotomy family as the earlier `omega`-disjunction entry, but the composition trap is far more common and is easy to miss because the goal looks like plain arithmetic: **rule — in a `Classical.choice`-gated law, never hand `omega`/`by_contra`/`decide_eq_true` a disjunctive goal; build the disjunct with `Or.inl`/`Or.inr` and let `omega` close only the conjunctive/arithmetic leaf.**
 - 2026-10-27 — **A `match`/`if` on a `Bool` *in the goal* (with `h : b = true` in context) is a dependent match: `subst h; rfl` and `cases b` both fail.** The symptoms are "`rfl` failed: the left-hand side `match true, ⋯` is not definitionally equal to …" and, for `cases`, "Dependent elimination failed". Neither is a `Classical.choice` leak — it is the motive mentioning the discriminee. Fix: `cases b <;> simp_all`, or restate so the match is not dependent (move the discriminee into a hypothesis), or prefer `if h : p then` to keep the fact in the branch. Recorded separately from the leak catalogue because the *fix* is different: no axiom problem, just a motive problem.
@@ -1639,18 +1645,17 @@ own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-
 
 ## Changelog
 
-- 2026-10-28 — **`WellFounded.fix` does not compile to a loop; and Lean timing has three
-  traps that silently report `0 us`.** Added two entries (see "Append new learnings") and a new
-  **Step 0** in §7: two functions over the same carrier computing the same relation, one defined
-  by `WellFounded.fix` on a dependent `Sigma`/`InvImage.wf` and one by a structural `foldr` over
-  the length index, differed by **588×** at n=4096 with bit-identical results. `WellFounded.fix` is
-  `Acc`-based and threads a higher-order `ih`, so it re-enters the recursion machinery per element
-  rather than emitting a loop; prefer structural recursion, and when you need the well-founded form
-  for totality, bridge to it with a `…_eq` theorem instead of making it the definition. The
-  measurement entry records the traps: `lake env lean` **interprets** and its `main` never runs;
-  forcing only `.length`/`.1` lets the compiler elide the payload and report `0 us`; and a single
-  warm call is not a measurement (batch and scale `n` — a clean 4× for 2× size means Θ(n²), usually
-  a bug). Acceptance test: any `0 us` lane means "not measured", never "instant".
+- 2026-10-28 — **A "fast structural rewrite" was a measured no-op; decompose before rearchitecting.**
+  Added a dated entry (see "Append new learnings") and rewrote §7's **Step 0**. The trigger was a
+  500× slowdown in a function defined by `WellFounded.fix`; rewriting it with `termination_by`
+  changed the time by **0.5%**, because Lean elaborates both to the same well-founded recursion —
+  so "re-express structurally" is not an optimization. Decomposing the composite showed all the
+  parts were cheap (140 µs) while the whole cost 91,382 µs: the function was a backtracking
+  *search* that re-invoked a decoder over the whole remaining buffer at every level, and a
+  single-pass fold did the same work 519× faster (176 µs). Step 0 now says: time the parts first;
+  if the parts are cheap and the whole is not, the cost is the control flow between them. Retained
+  from the same session: the measurement-trap entry (interpreter does not run `main`; unforced
+  results are dead-code-eliminated; batch and scale `n`).
 
 - 2026-10-26 — **Dependent elimination is its own `Classical.choice` leak; and "unique inverse"
   laws are assembly.** Added two entries (see "Append new learnings"): (a) `match`/`cases` on a
