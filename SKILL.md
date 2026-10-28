@@ -474,7 +474,11 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
    it is backtracking search, not a tail loop).
 
 **Step 0 — before any of the above: decompose, then ask whether the *control
-flow* is the cost.** Time the components in isolation before rearchitecting
+flow* or the *result type* is the cost.** Measured hierarchy of the same work
+(one array read per element, against a `memcpy` floor of 1×): accumulating cursor
+loop **8.5×** → plain `Array.get` loop 6.2× → per-step `List` **47×** →
+backtracking search **~10^5×**. So single-digit multiples of C are normal in pure
+Lean, and anything far above that is a design choice you can name. Time the components in isolation before rearchitecting
 anything: a super-linear composite whose *parts* are linear means the cost is in
 how they are composed, not in any one of them. The most common shape is a
 **search where a single pass would do** — e.g. a decoder that re-invokes itself
@@ -500,6 +504,17 @@ reach for the carrier swap in step 1.
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-28 — **The *result type* decides the order of magnitude, and the gap between a `List`-returning and a cursor-returning step is ~5× on the same reads.** Same data, same machine, same run, one process — measured against a `memcpy`-class bulk op as the C reference:
+
+  | path | MiB/s | vs `memcpy` |
+  | --- | --- | --- |
+  | `memcpy`-class bulk op | 1,891 | 1× |
+  | **bulk cursor decode** (read a byte, `Array.push`) | **222** | **8.5×** |
+  | plain `Array.get` loop | 307 | 6.2× |
+  | per-step `List` decode (`[(a[i], i+1)]` per byte) | 40 | 47× |
+  | backtracking *search* decoder | ~0.01 | ~10^5× |
+
+  **Rule: a small single-digit multiple of C is reachable in pure Lean** (`Array UInt8` + an integer cursor + an `Id.run do` accumulating loop, ~8.5×), so "Lean is 20-40× off C" is an *architecture* statement, not a language one. A path that is 47× is returning a `List` per step (a cons cell + `Prod` + boxed `Nat` for what is one array read); a path that is 10^5× is doing a **search** where a single pass would do. Diagnose by measuring one step in isolation: 6,100 µs for n steps of "one array read" vs 767 µs for the same reads in a plain loop is a 8× that no scalar-type change can touch. Corollary: assert the **ratio to a same-run `memcpy`**, never an absolute MiB/s floor — an absolute floor is machine-dependent and gets tuned down the first time CI is slow, while the ratio is the property you actually mean. Corollary 2: when the requirement is "within N× of C", make the *result type* the first design question, before any FFI or backend work.
 - 2026-10-28 — **A "fast structural rewrite" of a slow function was measured as a NO-OP — because `termination_by` elaborates to the *same* well-founded recursion. Attribute before you rewrite.** A function defined by `WellFounded.fix (InvImage.wf (fun x => x.1) Nat.lt_wfRel.wf) …` looked like the obvious culprit for a 500× slowdown (its emitted IR really does contain `lp_WellFounded_fixC…` and allocates a closure per level). Rewriting it with `termination_by n _ => n` + `decreasing_by` changed the time by **0.5%** (93,691 µs vs 94,137 µs at n=4096): Lean compiles the structural-looking form to the same `WellFounded.fix` machinery, so it is not even a codegen change. The real cost, found by decomposition, was **algorithmic**: the function was a backtracking *search* re-invoking a decoder over the whole remaining buffer at every level (Θ(n²) work), where a single-pass fold over the same helper did 519× better (176 µs). **Lesson — decompose before you rearchitect:** time the components in isolation (here: all n `decode` calls in a plain loop = 140 µs; `.attach` = nil; building the result list = nil; the composite = 91,382 µs). If the parts are cheap and the whole is not, the cost is the *control flow between* them, and no amount of definition-style rewriting will touch it. Corollary, for `@[extern]`/IR snooping generally: seeing scary-looking machinery in the emitted C is not evidence that it costs anything — measure that layer too. Corollary 2: `termination_by`-structural and `WellFounded.fix` are the *same* thing; do not present the former as an optimization.
 - 2026-10-28 — **Measuring Lean performance has three traps that all report `0 us` or a plausible-but-wrong number; force the value or you measured nothing.** (1) **`lake env lean file.lean` *interprets*** — it does not compile, and a `main` defined there **does not run at all**, so timings from it (or from `#eval` on a large computation) are meaningless; you need a real `lean_exe` (`lakefile.lean`: `lean_exe foo where root := \`Foo`) and run the built binary. (2) **Dead-code elimination**: if you time `(f x).length` or `(g x).1`, the compiler can compute only the length/index and elide the payload — a function that *should* take seconds reports `0 us` while printing a correct-looking answer. Force the whole value through a returned tuple, e.g. `let (out, dt) ← timeBatch 1 fun _ => f x` where `timeBatch` returns `(α × Nat)`, exactly the shape a bench harness should have. (3) **A warm-cache first call is not a measurement**, and neither is one run — batch `reps` and divide, and sanity-check by scaling `n` (a clean 4× time for 2× size means Θ(n²), which is usually a bug, not a constant factor). **Acceptance test: if any of your lanes reports `0 us`, treat it as "not measured" and fix the forcing — never as "instant".** Corollary: an A/B must differ in *exactly one* dimension; hold the types, the helpers, and the input identical, so the delta is attributable.
 - 2026-10-27 — **`decide_eq_true (by omega)` on a *disjunction* leaks `Classical.choice` — `omega` closes a `∨` by case analysis (trichotomy), so building the disjunct explicitly is the fix.** `#print axioms` on `theorem t (n : Nat) (h : 65 ≤ n ∧ n ≤ 70) : decide ((48 ≤ n ∧ n ≤ 57) ∨ (65 ≤ n ∧ n ≤ 70)) = true := decide_eq_true (by omega)` reports `[propext, Classical.choice, Quot.sound]`, while `decide_eq_true (Or.inr h)` on the same goal is clean. `decide` is not the problem — the *disjunctive* proof handed to it is. This is the same `Nat.lt_or_gt_of_ne`/trichotomy family as the earlier `omega`-disjunction entry, but the composition trap is far more common and is easy to miss because the goal looks like plain arithmetic: **rule — in a `Classical.choice`-gated law, never hand `omega`/`by_contra`/`decide_eq_true` a disjunctive goal; build the disjunct with `Or.inl`/`Or.inr` and let `omega` close only the conjunctive/arithmetic leaf.**
@@ -1644,6 +1659,15 @@ own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-
   change) before trusting it.
 
 ## Changelog
+
+- 2026-10-28 — **The result type decides the order of magnitude: single-digit multiples of C are
+  reachable in pure Lean.** Added a dated entry with the measured hierarchy (cursor loop 8.5×,
+  `Array.get` 6.2×, per-step `List` 47×, search ~10^5×, all against a `memcpy` floor of 1×) and
+  extended §7 Step 0 to ask "result type" alongside "control flow". Two rules that follow:
+  (a) a path that is 47× is returning a `List` per step, a path that is 10^5× is searching where one
+  pass would do — neither is a scalar-type problem, so no `USize`/`UInt64` rewrite will move them;
+  (b) assert the **ratio to a same-run `memcpy`**, never an absolute MiB/s floor, because an
+  absolute floor is machine-dependent and gets tuned down instead of investigated.
 
 - 2026-10-28 — **A "fast structural rewrite" was a measured no-op; decompose before rearchitecting.**
   Added a dated entry (see "Append new learnings") and rewrote §7's **Step 0**. The trigger was a
