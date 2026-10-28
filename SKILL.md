@@ -504,6 +504,7 @@ reach for the carrier swap in step 1.
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
 
+- 2026-10-28 — **A lazily-composed *input* is the same trap as a lazily-composed result: feeding a "dropped prefix" function its own output builds a closure chain, and reading through it is Θ(depth).** A decoder returned its remainder as a function (`drop k s` is a *closure over `s`*, cheap and non-copying) — which is the right design for memory, and the wrong one for iteration. Passing that remainder back in as the next step's input **composes** the closures, so reading byte 0 at depth `k` applies `k` closures: O(1) per step becomes O(k), O(n) becomes Θ(n²). Measured on otherwise identical work (n `decode` calls, same helpers): **chained remainder 92,876 µs vs re-derived from the root 139 µs at n=4096 — 668×**. Fix: keep the **original** input fixed and carry a consumed-count cursor, re-deriving each step as `drop m root`; the composition lemma (`drop m (drop k s) = drop (k+m) s`, up to the length cast the type index forces) is what licenses it. Effect: 24.9 s → 2.75 ms at n=65536, and the walk goes linear. **Diagnostic**: if a "fast" lazy carrier is O(1) per step yet the whole run is super-linear, time `chained` vs `flat` over the same helpers — a large gap is the chain, not the algorithm. Corollary: this is invisible to `#print axioms` and to any per-operation profile; only an end-to-end A/B that differs in *exactly* this one dimension finds it.
 - 2026-10-28 — **The *result type* decides the order of magnitude, and the gap between a `List`-returning and a cursor-returning step is ~5× on the same reads.** Same data, same machine, same run, one process — measured against a `memcpy`-class bulk op as the C reference:
 
   | path | MiB/s | vs `memcpy` |
@@ -1659,6 +1660,15 @@ own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-
   change) before trusting it.
 
 ## Changelog
+
+- 2026-10-28 — **A lazily-composed input is the same trap as a lazily-composed result.** Added a
+  dated entry: a decoder returning its remainder as a *closure* (`drop k s` over `s`) is right for
+  memory and wrong for iteration — feeding it back **composes** closures, so reading at depth `k`
+  applies `k` closures (Θ(n²)); measured 92,876 µs chained vs 139 µs re-derived from the root at
+  n=4096 (**668×**), and 24.9 s → 2.75 ms at n=65536 once the input is re-rooted with a
+  consumed-count cursor. Diagnosis: when a lazy carrier is O(1) per step but the run is
+  super-linear, time `chained` vs `flat` over the same helpers — the gap is the chain. This is
+  invisible to `#print axioms` and to any per-operation profile.
 
 - 2026-10-28 — **The result type decides the order of magnitude: single-digit multiples of C are
   reachable in pure Lean.** Added a dated entry with the measured hierarchy (cursor loop 8.5×,
