@@ -28,7 +28,7 @@ skill does not cover.
 | `ByteArray` proofs won't reduce / `simp` stalls on a primitive | [§2 Proving over primitives](#2-proving-over-primitives) |
 | A `partial def`/recursive combinator won't typecheck | [§3 `partial`, coinduction, nonempty](#3-partial-coinduction-nonempty) |
 | Notation collision with a reserved token (`\|`, `*`, `$`, `open`) | [§4 Notation & keyword collisions](#4-notation--keyword-collisions) |
-| How do I make a parser/codec *fast*; why is it ~20-40x off C? | [§7 Work faster (carrier swap > FFI > compiler)](#7-work-faster-carrier-swap--ffi--compiler-and-lean-on-usize) — and the 2026-10-18 "boxed scalar ceiling" entry in the Append |
+| How do I make a parser/codec *fast*? | [§7 Work faster (carrier swap > FFI > compiler)](#7-work-faster-carrier-swap--ffi--compiler-and-lean-on-usize) — and the 2026-10-28 "result type decides the order of magnitude" entry in the Append |
 
 ---
 
@@ -533,6 +533,8 @@ reach for the carrier swap in step 1.
 
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
+
+- 2026-10-31 — **When an induction's spec index and the recursor's index are numerically equal but not definitionally equal, write the lemma's statement with the *recursor's* form and the mismatch never arises — and then rewrite only the RHS with `conv`.** Two halves of one fix, both cheaper than any transport argument: (1) a target type `Suffix (n - m)` and a recursor that produces `Suffix (Suffix.drop m s).remaining` are not definitionally equal *in the `Suffix (·)` position*, so an induction hypothesis at one cannot be used at the other; stating the core lemma's conclusion with `(Suffix.drop m s).remaining` makes the `n - m = 0` base case close *outright* and removes the need to transport anything. (2) Once stated that way, the spec side is reachable with `conv => rhs; rw [recursion_eq …]` — rewriting **only the right-hand side** so that a hypothesis whose type depends on the left-hand term (e.g. a `have hmem :=` produced by a `mem`-style lemma) is never touched, which is exactly what a whole-goal `rw` would break. General rule: when a lemma is stuck because one side's type index has a reducible-but-not-definitionally-equal alias, **choose the alias the recursor generates** rather than proving they agree.
 
 - 2026-10-31 — **"Motive is not type correct" is almost always a dependent `rw`, and the fix is to change the *statement*, not to fight the tactic.** A rewrite fails when it must abstract over a term that other hypotheses or the goal's own type depend on. Three shapes, all hit in one session, with the fix for each:
   1. **Rewriting under a `List.attach`.** `l.attach` carries a `Membership` proof per element, so any term mentioning `x ∈ l` depends on `l`; `rw [h]` on `l` then fails. Fix: take the list as a **parameter** and `cases`/`induction` on it — never rewrite it. (`cases d` then `simp only [List.attach_cons, List.cons.injEq, Subtype.mk.injEq]` reduces both sides to `… = hd`, and the pair is then proved by transitivity.)
