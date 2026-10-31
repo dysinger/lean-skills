@@ -432,6 +432,31 @@ Key facts, each a non-obvious gotcha:
   git-tracked before `nix build`/`flake` sees it; the failure is `lake` printing
   "no configuration file with a supported extension" for *both* `lakefile.lean` and
   `lakefile.toml`.
+- **`-DwarningAsError=true` cannot be passed on the `lake build` command line —
+  put it in `moreLeanArgs` on the `lean_lib`.** `lake build -DwarningAsError=true`
+  fails with `unknown short option '-D'`, and `lake build -- -D…` treats the flag as
+  a *target*. Neither `LEAN_OPTS` nor `-K` is forwarded to the compiler invocation
+  (verify with `lake build -v` and read the `trace: .> LEAN_PATH=… lean …` line).
+
+  ```lean
+  @[default_target]
+  lean_lib foo where
+    roots := #[`Foo]
+    moreLeanArgs := #["-DwarningAsError=true"]
+  ```
+
+  This is also the *better* place for a proof gate than a Nix derivation flag: the
+  setting rides on the **library**, so every consumer that compiles it (an `exe`,
+  a sandboxed `nix build` check) inherits it and there is no way to build
+  unguarded. Confirm it took effect from the `trace:` line showing
+  `lean -DwarningAsError=true …`.
+- **`lake build` only *warns* on `sorry`; it does not fail.** `declaration uses
+  'sorry'` is a warning, so a CI "proof gate" that is a plain `lake build` goes
+  green with an incomplete proof. The `warningAsError` setting above is what makes
+  the compiler the authority — and it also catches `admit` and tactic-generated
+  `sorryAx`, which a `grep`-based gate would miss. Prove the gate is load-bearing:
+  stub one theorem to `sorry`, confirm the build fails *and* names the declaration,
+  then restore.
 
 ---
 
@@ -508,6 +533,20 @@ reach for the carrier swap in step 1.
 
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
+
+- 2026-10-31 — **"Motive is not type correct" is almost always a dependent `rw`, and the fix is to change the *statement*, not to fight the tactic.** A rewrite fails when it must abstract over a term that other hypotheses or the goal's own type depend on. Three shapes, all hit in one session, with the fix for each:
+  1. **Rewriting under a `List.attach`.** `l.attach` carries a `Membership` proof per element, so any term mentioning `x ∈ l` depends on `l`; `rw [h]` on `l` then fails. Fix: take the list as a **parameter** and `cases`/`induction` on it — never rewrite it. (`cases d` then `simp only [List.attach_cons, List.cons.injEq, Subtype.mk.injEq]` reduces both sides to `… = hd`, and the pair is then proved by transitivity.)
+  2. **Rewriting a `Finset`/`Sigma`-packed index.** `rw [hk]` inside `f ⟨n, s⟩` cannot abstract because `s : Bytes n` mentions `n`. Fix: state the lemma with the index **abstract and the equality as a hypothesis** (`∀ k t, k = 0 → f k t = …`), so the caller supplies the arithmetic and no in-place rewrite is needed.
+  3. **Rewriting a length inside an indexed type.** `Suffix (Suffix.drop m s).remaining` and `Suffix (n - m)` are numerically equal but **not definitionally equal in the `Suffix (·)` position**, so an induction hypothesis at one cannot be used at the other. Fix: write the *lemma's statement* using the form the recursor actually produces; the mismatch then never arises. Do not try to transport it.
+  Corollary: **rewrite one side at a time.** `conv => rhs; rw [eq]` reaches the conclusion without touching a hypothesis whose type depends on the term, and is often the difference between a 5-line proof and an unfinishable one.
+
+- 2026-10-31 — **For a `Bytes`-like indexed carrier, state equalities *pointwise* (as reads at indices) to avoid a length cast that then blocks everything.** The natural `Bytes`-level lemma (`t.bytes = drop …`) forces a cast at the index (`drop o s : Bytes (n - o)`, not `Bytes t.remaining`), and that cast is opaque to `rw`: every downstream rewrite fails with "motive is not type correct". Stating the *same* fact as `t.bytes i = s ⟨i.val + …, _⟩` for `i : Fin t.remaining` has **no cast anywhere**, and the downstream proof becomes `Fin.ext` + `omega`. This was the single decision that unblocked a month-long stuck proof; the cast form was a dead end attempted many times.
+
+- 2026-10-31 — **`omega` will not use a hypothesis whose type contains a projection that hasn't reduced.** `t.hle : t.remaining ≤ (drop m s).remaining` looks usable, but `omega` sees the `drop` and gives up. Fix: **restate it numerically first** — `have h : t.remaining ≤ n - m := t.hle` — then `omega` closes immediately. Same class as the modulo rule: `omega` wants a plain numeric hypothesis, not one wrapped in a definition.
+
+- 2026-10-31 — **`congr 2` can be the entire proof of a `WellFounded.fix` recursion equation, and is load-bearing when it is.** To unfold a `WellFounded.fix`-defined recursive function at a `Nat.succ` index: `rw [f, WellFounded.fix_eq]` then `simp only [Nat.add_one]` then `congr 2`. The last step discharges the residual comparison of the fix's `ih` against the function itself — which *is* the fix point, definitionally — so the goal does not close without it. Do not delete it as "redundant"; a `congr` that seems to do nothing may be doing the only step that matters.
+
+- 2026-10-31 — **A `match`-based recursion's `.eq_def` rewrite is often a complete proof, so follow it with nothing.** `rw [f.eq_def]` on a `match`-defined function whose scrutinee is already a known constructor form reduces the goal entirely; appending `cases`/`simp` to be safe then errors with **"No goals to be solved"**. If a tactic line errors that way, the fix is to *delete the following lines*, not to add `try`.
 
 - 2026-10-28 — **A lazily-composed *input* is the same trap as a lazily-composed result: feeding a "dropped prefix" function its own output builds a closure chain, and reading through it is Θ(depth).** A decoder returned its remainder as a function (`drop k s` is a *closure over `s`*, cheap and non-copying) — which is the right design for memory, and the wrong one for iteration. Passing that remainder back in as the next step's input **composes** the closures, so reading byte 0 at depth `k` applies `k` closures: O(1) per step becomes O(k), O(n) becomes Θ(n²). Measured on otherwise identical work (n `decode` calls, same helpers): **chained remainder 92,876 µs vs re-derived from the root 139 µs at n=4096 — 668×**. Fix: keep the **original** input fixed and carry a consumed-count cursor, re-deriving each step as `drop m root`; the composition lemma (`drop m (drop k s) = drop (k+m) s`, up to the length cast the type index forces) is what licenses it. Effect: 24.9 s → 2.75 ms at n=65536, and the walk goes linear. **Diagnostic**: if a "fast" lazy carrier is O(1) per step yet the whole run is super-linear, time `chained` vs `flat` over the same helpers — a large gap is the chain, not the algorithm. Corollary: this is invisible to `#print axioms` and to any per-operation profile; only an end-to-end A/B that differs in *exactly* this one dimension finds it.
 - 2026-10-28 — **The *result type* decides the order of magnitude, and the gap between a `List`-returning and a cursor-returning step is ~5× on the same reads.** Same data, same machine, same run, one process — measured against a `memcpy`-class bulk op as the C reference:
