@@ -32,6 +32,9 @@ skill does not cover.
 | `rw` fails with "motive is not type correct" on a `Fin`-indexed definition | the 2026-11-02 "a `rfl`-equal choice of *spelling* can be the difference" entries — you are rewriting at the wrong index; change the type the equality is stated at, not the tactic |
 | A theorem needs two inductions that each depend on the other at a smaller measure | the 2026-11-02 "state them as one conjunction and induct once" entry |
 | `decreasing_by` won't close / `rename_i` gives "too many variable names" | the 2026-11-02 "mirror the working sibling" entry — copy the file's existing mutual pair, thread the `if` guard as an explicit hypothesis |
+| An unfolding lemma leaks `Classical.choice` though every lemma it cites is clean | the 2026-11-02 "`split` … and an *anonymous `by <tactic>` proof inside a `match` arm*" entry — the leak is in the arm or in `split` itself; make the bound a parameter |
+| Two `List.attach` lists should correspond and `rw` on `.attach` fails | the 2026-11-02 "read both positionally through `List.getElem?_attach`" entry |
+| A `Bytes`/`Fin n`-indexed function won't accept an equality (`Nat.sub_zero`, a length cast) | the 2026-11-02 "`decode_cast`-shaped transport lemmas" entry — prove the cast lemma, rewrite with it |
 | How do I time Lean code and trust the number? | the 2026-11-02 timing entry — a pure call in a loop gets hoisted, folds get deleted; one fresh call per sample, median, data-dependent sink |
 
 ---
@@ -537,6 +540,12 @@ reach for the carrier swap in step 1.
 
 Date-stamped, one line each, latest first. Keep entries generic (no project
 names/paths); the specific repo lives elsewhere.
+
+- 2026-11-02 — **`split` on a `match`-with-a-named-equation is itself a `Classical.choice` source, and an *anonymous `by <tactic>` proof inside a `match` arm* is the other half of the same leak — the two make an unfolding lemma leaky while its statement (and every lemma it cites) looks clean.** A recursive `def` whose body is `match _hm : n - m with | 0 => … | _ + 1 => f … (by omega) …` compiles its successor arm's bound as a tactic proof over facts only the arm knows. Proving the unfolders by `rw [f.eq_def]; split` then reports `[propext, Classical.choice, Quot.sound]`, and so does the same proof of the *zero* case — even though the surrounding file's other unfolders are clean. Bisection that names it fast: `#print axioms` on each lemma in turn and on the definition; if all are clean but the theorem is not, stub the theorem's body in halves (each `<;> sorry`) and see which half reintroduces `Classical.choice` — here one `rw [fast_succ …]` did, and `#print axioms` on *that* lemma showed the leak was already in it. **The durable fix is structural, not tactical:** make the bound an ordinary parameter of both the function and its search sibling (the candidate subtype already carries the `≤` field, so it is passed through rather than invented), after which `conv => lhs; rw [f.eq_def]; dsimp only; rw [h]` — the *other* recipe, which a previous entry says "does not transfer" — works cleanly. So the earlier entry's conclusion was a symptom of this leak, not an independent fact: **when `split` "works but `dsimp only` makes no progress", check the axiom footprint before adopting `split` as the recipe.**
+
+- 2026-11-02 — **To relate two `List.attach` lists of the *same* provenance, do not rewrite `attach` — read both positionally through `List.getElem?_attach` and prove the correspondence at an index.** Two attached candidate lists (one `{pr // pr ∈ decodeArray …}`, one `{pr // pr ∈ decode …}`) are element-for-element the same sequence, but stating that as `(a).attach = (b).attach.map f` and `rw`-ing the underlying list dies with "motive is not type correct": the `Membership` proof in each element mentions the list. The proof that does go through states the fact **at an index**: `∀ i c s, xs.attach[i]? = some c → ys.attach[i]? = some s → c.val.1 = s.val.1 ∧ …`, and opens both sides with `rw [List.getElem?_attach]` (which turns the read into `Option.pmap Subtype.mk xs[i]? _`), then `cases xs[i]?` and `Option.some.inj`. Two useful corollaries: `simp only [h] at hc` works where `rw [h] at hc` fails when the hypothesis is under an `Option.pmap`'s proof argument; and `List.length_attach`/`List.getElem?_attach`/`List.mem_of_getElem?` are the three lemmas the whole route needs. Pair this with an *alignment* record (`same length ∧ ∀ i, aligned`), which is what makes an induction over one list usable against the other.
+
+- 2026-11-02 — **`decode_cast`-shaped transport lemmas are needed for *any* `B`-indexed function, and the cheapest one is `subst` + `rfl` — but it must be proved as its own lemma, because inlining the transport hits the index's dependent motive.** Wanting `decodeFull n s = decodeFull m (cast (congrArg Bytes e) s)` from `e : n = m`, every attempt to `rw [e]` or `subst` at a use site failed on "motive is not type correct" (the `Bytes` argument's index). Proving `theorem decodeFull_cast (e : n = m) (s : Bytes n) : decodeFull n s = decodeFull m (cast … s) := by subst e; rfl` took one line, and every later `rw [decodeFull_cast … e …]` then fired. Same pattern as the pointwise-equality rule for indexed carriers: **state the transport as a lemma at the type the consumer's motive wants, then rewrite with it** — do not try to make the consumer's goal reduce. Also: when the equation is `Nat.sub_zero`-shaped (`n - 0 = n`), `rw` on it in a `B`-indexed goal is blocked exactly the same way, and the cast lemma is again the way through.
 
 - 2026-11-02 — **`mutual` is a *command*, so a `/-- … -/` doc comment cannot attach to it — and a `set_option … in` placed between the doc and `mutual` is a parse error, not an option.** Writing a documented mutual block, the doc comment above `mutual` fails with "unexpected token 'mutual'; expected … 'def' … 'theorem' …". The cause is that `mutual` is a command form with no declaration to attach a doc to, so the doc comment has nothing to bind and the parser expects a real declaration next. Two spellings work: use a **plain `/- … -/` block comment** (which is what the file's existing, compiling mutual pair already does — check before "fixing" it), or move the doc onto the first `def` inside the block. A `set_option foo in` must go *inside* the block or *before* the doc comment, never between the doc and `mutual`. Cheap to fix, but the error text points at `mutual` and reads like a syntax catastrophe when the real problem is the doc comment.
 
@@ -1760,6 +1769,19 @@ own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-
   change) before trusting it.
 
 ## Changelog
+
+- 2026-11-02 — **Three proof-engineering deltas from a well-foundedness bridge, all about
+  *where a fact must be spelled* rather than which tactic to use.** (a) `split` on a
+  `match`-with-named-equation, and an anonymous `by <tactic>` proof *inside* a `match` arm,
+  are both `Classical.choice` sources — and the leak shows up in the unfolding lemmas while
+  every lemma they cite is clean. The fix is structural (make the bound an ordinary
+  parameter, passed through from a subtype's field), and it *restores* the
+  `conv`/`dsimp only`/`rw` recipe that an earlier entry had declared non-transferable.
+  (b) Two `List.attach` lists are related *positionally* (`List.getElem?_attach` + an index
+  correspondence), never by `rw` on `.attach`, whose `Membership` proof makes the motive
+  dependent. (c) A `Bytes n`/`Fin n`-indexed consumer needs its own `…_cast` transport lemma
+  (`subst e; rfl`) — including for `Nat.sub_zero` — because rewriting the equation at a use
+  site always dies on the index. Table rows added for all three.
 
 - 2026-10-28 — **A lazily-composed input is the same trap as a lazily-composed result.** Added a
   dated entry: a decoder returning its remainder as a *closure* (`drop k s` over `s`) is right for
