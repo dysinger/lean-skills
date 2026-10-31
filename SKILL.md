@@ -29,6 +29,10 @@ skill does not cover.
 | A `partial def`/recursive combinator won't typecheck | [§3 `partial`, coinduction, nonempty](#3-partial-coinduction-nonempty) |
 | Notation collision with a reserved token (`\|`, `*`, `$`, `open`) | [§4 Notation & keyword collisions](#4-notation--keyword-collisions) |
 | How do I make a parser/codec *fast*? | [§7 Work faster (carrier swap > FFI > compiler)](#7-work-faster-carrier-swap--ffi--compiler-and-lean-on-usize) — and the 2026-10-28 "result type decides the order of magnitude" entry in the Append |
+| `rw` fails with "motive is not type correct" on a `Fin`-indexed definition | the 2026-11-02 "a `rfl`-equal choice of *spelling* can be the difference" entries — you are rewriting at the wrong index; change the type the equality is stated at, not the tactic |
+| A theorem needs two inductions that each depend on the other at a smaller measure | the 2026-11-02 "state them as one conjunction and induct once" entry |
+| `decreasing_by` won't close / `rename_i` gives "too many variable names" | the 2026-11-02 "mirror the working sibling" entry — copy the file's existing mutual pair, thread the `if` guard as an explicit hypothesis |
+| How do I time Lean code and trust the number? | the 2026-11-02 timing entry — a pure call in a loop gets hoisted, folds get deleted; one fresh call per sample, median, data-dependent sink |
 
 ---
 
@@ -2377,3 +2381,62 @@ own template; a *block* codec that packs bits across bytes is NOT.**  The fixed-
   encoder emits exactly one spelling"). `Normal`/`Normalizer` wins: it is the term of art for a
   rewriting system's normal forms, it is unused in the project, and `fill`/`normal` read
   naturally against it.
+
+- 2026-11-02 — **A `rfl`-equal choice of *spelling* can be the difference between provable and
+  unprovable, when the term is an index.** `decodeFull p h n s` is `Fin n → UInt8`-indexed. Writing
+  the root as the structure projection `(Suffix.drop m s).bytes` — which *is* `bdrop m s` by `rfl` —
+  makes every `rw`/`generalize` on the (equal but non-syntactic) length fail with "motive is not
+  type correct". Writing it as `bdrop m s` puts a literal `n - m` at the index and the same
+  rewrites go through. **Lesson: when a definition is `Fin`-indexed, spell the term at the index
+  the recursor's motive wants, even if a projection is definitionally equal to it.** A corollary
+  for case analysis: `decodeFull` at a root that is *known* to be `0` (as `n - m` with
+  `n - m = 0`) still needs the length cleared — `subst` on a `Nat.sub` equation fails
+  ("invalid equality proof"), so state the fact as a hypothesis to a lemma
+  (`decodeFull_at_zero … (h : k = 0)`) and let the caller supply the arithmetic.
+
+- 2026-11-02 — **A structure field whose type is `n - m` is not the same term as `bdrop m s`, and
+  a `Suffix`-typed equation is the escape hatch through the dependent-`Bytes` wall.** Proving
+  `decodeFull … (n - (m + (n-m-r))) (bdrop (m + (n-m-r)) s) = decodeFull … r t.bytes` by rewriting
+  the *length* always fails ("motive is not type correct"). What works: `show` the goal at the
+  `Suffix.drop …` projection (reducible to `bdrop`), then `rw` a **`Suffix`-typed** equation
+  (`Suffix.drop k s = Suffix.trans (Suffix.drop m s) t`) — a rewrite at the `Suffix` type is
+  accepted where the length rewrite is not — and the residue is `rfl`. Same family as the
+  "state it pointwise" rule: **change the type at which you state the equality, not the proof of
+  the equality.**
+
+- 2026-11-02 — **When a theorem needs two mutually-dependent inductions at different measures,
+  state them as one conjunction and induct once.** A "fast decoder ⇄ candidate search" pair needs
+  the decoder's congruence to discharge the search's step hypothesis at an *advanced* cursor. Stated
+  separately neither is provable (each needs the other at a smaller measure); stated as
+  `(∀ acc, fast …) ∧ (∀ acc cands, search …)` under a single `Nat.strongRecOn` on the remaining
+  length, both go through — the search's own induction-hypothesis argument sits at a strictly
+  shorter length, so the same recursor supplies it. Also: the outer statement should be the
+  *general* one (arbitrary cursor and accumulator) with the headline theorem as a trivial case
+  (`m = 0`), because a root-only statement is exactly the one whose induction hypothesis is not in
+  scope.
+
+- 2026-11-02 — **Mirror the working sibling rather than re-deriving `decreasing_by` from
+  intuition.** A mutually recursive pair with a `Prod.Lex` measure elaborates fine when written
+  exactly as an existing pair in the same file: equation-style bodies (`| k, acc, cands => …`),
+  `termination_by` naming **those pattern variables**, and the *same* measure type in both
+  `termination_by`s (else "termination measures must have the same return type"). Symptom of
+  guessing instead: `rename_i` giving "too many variable names provided", `hk` "unknown identifier"
+  inside `decreasing_by` — the `if h : …` binder is **not** reliably in scope there, so thread the
+  guard as an **explicit hypothesis parameter** (`(hk : k < a.size) → …`). With it explicit the
+  obligation is one `omega`. **Do not substitute `WellFounded.fix` to avoid `decreasing_by`**: it
+  changes the reduction equation to `WellFounded.fix_eq`, so every downstream proof needs
+  `unfold; rw [WellFounded.fix_eq]` instead of `rw [….eq_def]` — importing a proof-engineering
+  problem to dodge a plumbing one.
+
+- 2026-11-02 — **Timing Lean code from inside Lean is a trap with four distinct failure modes;
+  measure by hand with one fresh call per sample.** All four produced a wrong number that was
+  briefly believed: (1) timing `(…).isSome`, or folding the result to a `sum`/`length`, lets the
+  compiler **delete the computation** — reported a literal `0 ns/op`; (2) a **pure call with
+  loop-invariant arguments is hoisted out of the loop**, so the timed region is empty — and making
+  the input vary *does not* necessarily stop it if the closure keeps the same shape; (3) a
+  **mean over a short batch** swallows allocator cold-start (first `copySlice` ~125 µs, steady
+  state ~100 ns) and made the reference look 200× slow; (4) the **best-of-N picks up zero-length
+  spans** from a coarse clock. What worked: one fresh timed call per sample, a **data-dependent**
+  fold so nothing is elidable, **median** of interleaved samples, the reference interleaved in the
+  same samples, and check the load average first. If an in-process lane is unavoidable, have it
+  assert the *value* only and refuse to print a rate.
