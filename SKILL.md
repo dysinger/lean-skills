@@ -739,9 +739,11 @@ that only make sense knowing a particular byte-codec/substrate library (`Bytes n
 live in that project's own repository, not here. The project this file was grown
 in keeps its half in `openspec/lean-notes.md` in the `lean-codec` repository; if
 you are working there, **read that file too** — it is the raw measured record
-behind §2b's table and the source of most entries here. (57 of the entries exist in
-both files; that duplication is recorded in `lean-notes.md`'s header and in the
-repo's task ledger, not hidden.) **The authoritative summary of the axiom-hygiene
+behind §2b's table and the source of most entries here. **The two files are not
+mirrored, and the split is measured rather than asserted:** on a 2026-11-02 count
+the repo file held 178 entries and this one 59, with 8 (not 57) appearing word-for-word
+in both. Do not reason from an entry-count identity; if you need a specific lesson,
+grep both. **The authoritative summary of the axiom-hygiene
 family is §2b's table, not these entries** — add a row there when you learn a new
 leak shape.
 
