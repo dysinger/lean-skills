@@ -694,10 +694,12 @@ are *type-level* moves inside Lean, `[propext, Quot.sound]`-only:
 
 **Step 0 — before any of the above: decompose, then ask whether the *control
 flow* or the *result type* is the cost.** Measured hierarchy of the same work
-(one array read per element, against a `memcpy` floor of 1×): accumulating cursor
-loop **8.5×** → plain `Array.get` loop 6.2× → per-step `List` **47×** →
-per-step **chained lazy closures** **~10^5×**. So single-digit multiples of C are
-normal in pure Lean, and anything far above that is a design choice you can name.
+(one array read per element, against a `memcpy` floor of 1×): plain `Array.get` loop
+~**200×** → accumulating cursor loop ~**250×** → per-step `List` **47×** → per-step
+**chained lazy closures** **~10^5×**. So single-digit multiples of C are normal in
+pure Lean, and anything far above that is a design choice you can name. **Re-measure
+these before quoting them** — an earlier revision of this paragraph carried 8.5×/6.2×
+that no lane ever printed (see the entry on measurement integrity in the Append).
 Time the components in isolation before rearchitecting anything: a super-linear
 composite whose *parts* are linear means the cost is in how they are **composed**,
 not in any one of them. Two shapes account for most of it, and they look nothing
@@ -727,6 +729,8 @@ reach for the carrier swap in step 1.
 
 Reverse-chronological (latest first), one **entry** per lesson — entries are
 paragraphs, not one-liners; keep each one focused on a single transferable fact.
+
+- 2026-11-02 — **A benchmark number is sourced because the lane, run, prints it — not because a lane exists.** Three performance rows in a doc were each labelled with the name of a `benchRatio` lane and none of them matched what that lane printed; the rows had been written from an earlier ad-hoc probe and the lanes added later. Worse, two of the lanes were *themselves* wrong, in ways that are generalisable: (a) a "floor" lane that `Array.push`-ed every element into a fresh output array measured the floor **plus n elements of growth** and then quoted the total as "the achievable floor" — it read ~15 ns/step with the push and ~15 without it only once the push was replaced by a `Nat` sink, so the allocation was most of the number; (b) a "per-step" term that built its list **once over the whole input** and let the harness divide by `n` reported ~12 ns/"step" — *below* the 48 ns/step decode it was a component of, an arithmetic impossibility that was visible for several revisions to anyone who compared two rows. **Three checks catch both, and they are cheap:** (i) after adding a lane, paste its literal output next to the quoted figure in the same session — if they differ, the doc is wrong, not the number; (ii) sanity-check every per-step term against the whole it composes — a component cannot exceed its composite unless the composite amortises it, and if it does, it is not a per-step quantity; (iii) read the lane's own body for allocation and for a divisor that does not match what one call does. `benchRatio`'s per-byte division is a footgun for anything that is naturally per-*call*: report those through a plain `ns/op` print instead of manufacturing a denominator.
 
 **Scope, stated once so it can be checked:** everything here is **stdlib-only**
 (no mathlib — so no `split_ifs`, no `omega` extensions, and `exact?`/`apply?` are
