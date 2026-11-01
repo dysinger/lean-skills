@@ -360,6 +360,25 @@ and the fix is always structural.
    `T (·)` position**, so an induction hypothesis at one cannot be used at the
    other. Fix: write the *lemma's statement* using the form the recursor actually
    produces; the mismatch then never arises. Do not try to transport it.
+4. **A `simp only` goal containing a dependent `if`/`dite`.** `simp only [f, g]`
+   unfolds `f`/`g` **inside the scrutinee's type**: `if h : i.val < f n then a else b`
+   becomes `if h : i.val < 0 then a else b`. Verified minimal reproducer — with
+   `def mylen (n : Nat) : Nat := 0`, the goal `(if h : i.val < mylen n then i.val
+   else 0) = i.val` shows `i.val < 0` after `simp only [mylen]`. A lemma stated at
+   the `f n`-spelling still has the right *term*, but the goal no longer resembles
+   it, so `rw` reports "did not find the pattern" while the hypothesis you hold is
+   literally the right equation. Fix: prefer `unfold` + targeted `rw` (or `conv`)
+   over `simp only` in such a goal, or state the helper **at the variable length**
+   (`∀ k, …`, with `k := f n` supplied by the caller) so nothing gets rewritten
+   inside a scrutinee's type.
+
+**Diagnose with a failing `example`, not with a remembered error message.** When a
+rewrite is stuck, the first thing to write is a two-line `example` isolating the
+mechanism you think is responsible, asserted with `fail_if_success`, and check
+that it *does* fail. A plausible root cause is a hypothesis with a cheap test;
+"the eliminator rejects a projection" or "`cases` cannot see through a
+hypothesis" sound authoritative and are frequently false. Two sessions of a
+stuck proof were spent building on a diagnosis that one `example` refuted.
 
 **Corollary: rewrite one side at a time.** `conv => rhs; rw [eq]` reaches the
 conclusion without touching a hypothesis whose type depends on the term, and is
