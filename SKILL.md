@@ -1,6 +1,6 @@
 ---
 name: lean
-description: Supplements the official `lean4` skill with our own accumulated *generic* Lean 4 / Lake learnings — module & namespace layout, lakefile roots, the `Classical.choice` leak catalogue, `if`/`ite`/`Bool`-goal and "motive is not type correct" recipes, `partial`/coinductive definitions, notation collisions, and performance-measurement discipline. Use alongside `lean4`. Holds only deltas, never duplicates its content, and only the reusable half — each project keeps its domain-specific notes in its own repository.
+description: Supplements the official `lean4` skill with our own accumulated *generic* Lean 4 / Lake learnings — module & namespace layout, lakefile roots, the `Classical.choice` leak catalogue, `if`/`ite`/`Bool`-goal and "motive is not type correct" recipes, `partial`/coinductive definitions, notation collisions, reducibility (`split`/`unfold` vs structure projections, and `decide`'s reach), and performance-measurement discipline. Use alongside `lean4`. Holds only deltas, never duplicates its content, and only the reusable half — each project keeps its domain-specific notes in its own repository.
 license: CC-BY-4.0
 ---
 
@@ -52,6 +52,7 @@ in that order and record the ruling here.
 | A `partial def`/recursive combinator won't typecheck | [§3 `partial`, coinduction, nonempty](#3-partial-coinduction-nonempty) |
 | Notation collision with a reserved token (`\|`, `*`, `$`, `open`) | [§4 Notation & keyword collisions](#4-notation--keyword-collisions) |
 | `deriving Repr` fails / `#eval` says "unable to synthesize `MonadEval`" | [§5 Library ergonomics (Repr / #eval)](#5-library-ergonomics-repr--eval) |
+| **`split`/`unfold` will not reduce a structure projection; `decide` says "could not reduce"; `#eval` on a relation reports no `Decidable`** | [§5b Reducibility](#5b-reducibility-splitunfold-vs-structure-projections-and-decides-reach) |
 | Linking hand-written C into a `lean_exe`; script `lakefile` gotchas; making `-DwarningAsError` stick | [§6 Lake build customization](#6-lake-build-customization-extern-c-ffi-link-script-lakefile) |
 | How do I make a parser/codec *fast*? | [§7 Work faster (carrier swap > FFI > compiler)](#7-work-faster-carrier-swap--ffi--compiler-and-lean-on-usize). Quote **ns/element against a measured pure-Lean floor**, never a `×` against `memcpy` — that is a category error for a per-element parser. |
 | `rw` fails with "motive is not type correct" on a `Fin`-indexed definition | you are rewriting at the wrong index — see [§2c](#2c-motive-is-not-type-correct--change-the-statement-not-the-tactic); prove a `…_cast` / pointwise lemma instead |
@@ -194,7 +195,7 @@ add a row (not a new scattered entry) when you find a new shape.
 | **`split` on a `match`-with-a-named-equation**, and **an anonymous `by <tactic>` proof inside a `match` arm** | the unfolding lemma is dirty while its statement and every lemma it cites are clean | Make the bound an **ordinary parameter** rather than something derived by a tactic inside the arm (a subtype's `≤` field passed straight through), after which the `conv => lhs; rw [f.eq_def]; dsimp only; rw [h]` recipe works. Diagnostic: `#print axioms` each cited lemma in turn; if all are clean, the arm or `split` itself is the source. |
 | **`simp`/`rw` reaching a classical lemmas' route** — e.g. `simp [f]` that passes through `List.length_ofFn` | looks like an innocent simp-set choice | Replace with the direct lemma: `show (List.ofFn s).length = n; exact List.length_ofFn` reports `[propext]` where `simp [f]` reported `[propext, Classical.choice, Quot.sound]`. Common at a **transport lemma**, which is exactly where it recurs. |
 | **`omega` on a `Nat`-subtraction trichotomy**, or **`omega` asked to derive a modulo *existential*** | `omega` picks a branch classically | Case-split on `Nat.le_total` first, and state the *equational* form: `n = 4 * k → n % 4 = 0` **is** in `omega`'s fragment and closes clean; `∃ k, n = 4 * k` from `n % 4 = 0` is not, and `omega` cannot *use* a modulo hypothesis. |
-| **`Array.extract`'s readback** (`Array.toList_extract`, `Array.getElem_extract`) | both report `[propext, Classical.choice, Quot.sound]` on 4.34, so *every* route that reads an `Array.extract` back as a list inherits it | There is no clean route: design around it. `Array.ext'` is innocent — check the individual lemma, not just the tactic. Honest fallback when the fast transport is worth having is a recorded decision plus a measurement, never a weakened statement and never a `sorry`. |
+| **`Array.extract`'s readback** (`Array.toList_extract`, `Array.getElem_extract`) | both report `[propext, Classical.choice, Quot.sound]` on 4.34 **and still on 4.35.0** (re-checked 2026-11-05), so *every* route that reads an `Array.extract` back as a list inherits it | There is no clean route: design around it. `Array.ext'` is innocent — check the individual lemma, not just the tactic. Honest fallback when the fast transport is worth having is a recorded decision plus a measurement, never a weakened statement and never a `sorry`. |
 
 **Two rules that keep this table honest.**
 
@@ -210,8 +211,8 @@ add a row (not a new scattered entry) when you find a new shape.
 `match o with | some x => …`.
 
 **`ByteArray` operations: which ones reduce depends on the version — check before
-reaching for `List UInt8`.** On **Lean 4.32+** (including 4.34, the version this
-file is written against): `ByteArray.append_assoc` exists
+reaching for `List UInt8`.** On **Lean 4.32+** (still true on 4.35.0, our current
+toolchain): `ByteArray.append_assoc` exists
 (`a ++ b ++ c = a ++ (b ++ c)`), and `(a.push b).data = a.data.push b` is `rfl`
 (that is the `data_push`-family projection, not a claim that `.push` itself is
 transparent). On **Lean ≤ 4.30** this was *not* so: `ByteArray.append`, `get!`,
@@ -575,6 +576,41 @@ evaluable.
 
 ---
 
+## 5b. Reducibility: `split`/`unfold` vs structure projections, and `decide`'s reach
+
+**A structure literal's projection does not reduce under `split`.** Given
+`structure S where f : α → Option β` and `def s : S := { f := fun a => match … }`,
+`split at h` on `s.f a = some y` fails with "could not split an `if` or `match`
+expression" — and `unfold s at h` does **not** help, because it leaves the record
+literal printed and the `match` opaque. `simp only [s] at h` **does** fire and
+exposes the `match`. Order to try: `simp only [<the def>] at h` → then `split`/`cases`.
+
+This is a special case of a general rule for unfolding: **`unfold` works on
+`def`s whose body is directly a `match`/`if`; `simp only [f]` is what works when
+the body is a record/`structure` literal or is hidden behind a projection.**
+
+**`decide` reduces only what has a `Decidable` instance *and* is transparent.**
+Three consequences, each of which cost a cycle:
+
+- An indexed relation defined as a `def` with an existential (`∃ m, …` over a
+  type family) has **no** `Decidable` instance, so `#eval` on it fails with
+  "failed to synthesize `Decidable …`". Evaluate a *computable sibling* (a list of
+  results) and convert memberships to the relation with principled lemmas; do not
+  try to decide the relation.
+- `decide` closes a goal whose definitions are all reducible — even a large
+  closed literal — so prefer `unfold f; decide` over a hand-built `have`
+  scaffold chain. The scaffold only adds places to get wrong.
+- A goal that goes through `List.filterMap` (or any recursion the kernel will not
+  unfold at a literal) does **not** reduce under `decide`; `native_decide` does.
+  `native_decide` is a trust escalation — use it only where the project allows it
+  (bench/example lanes, never for laws under an axiom gate), and say why in place.
+
+**`List.ofFn` equality across two different functions is not `rfl`.**
+`List.ofFn_inj` does not exist under that name; the working form is
+`congr 1; funext i; exact h i.1 i.2`.
+
+---
+
 ## 6. Lake build customization (`@[extern]` C FFI link, script lakefile)
 
 **Linking hand-written C into a `lean_exe` needs a script `lakefile.lean`, not
@@ -754,6 +790,14 @@ reach for the carrier swap in step 1.
 Reverse-chronological (latest first), one **entry** per lesson — entries are
 paragraphs, not one-liners; keep each one focused on a single transferable fact.
 
+- 2026-11-05 — **A gate's *universe* is a different defect from its *mechanism*; enumerate the population.** A repo hardened an axiom gate over two audit rounds until its partition over public **theorems** was airtight (every theorem either footprint-checked or explicitly allowlisted as compiler-generated). The next audit still found six public `def`s shipping with **zero** theorems — a dead `take` helper with no callers, an alias no theorem named, a `manyUpTo` with no law at all, three derived combinators with no `Rel` characterization — because a `def` is not a `thmInfo`, so it lived *outside the partition entirely*: not un-gated, but never enumerated. Two transferable facts. (a) **When a check enumerates "all the things of kind K", the next audit's finding is always "something relevant is not of kind K".** Before trusting a checker over a population, list the population by a *different* method (a `grep` of declarations) and diff it against the checker's universe. The gate was green and correct; the question nobody asked was "what is not a theorem". (b) **A *decidable* proxy is worth more than an undecidable ideal, if you say it is a proxy.** "Does this definition have a law?" is not decidable. "Does any gated theorem's *type* mention this constant?" is, and it closes the practically-present failure mode (silence) without pretending to be soundness. State the proxy as a proxy in the gate's own header — the value is that a lapse becomes a build failure, not that the property is certified.
+
+- 2026-11-05 — **A fork pin is a bet on a sha; drop its scaffolding with the goal.** A repo pinned `cauli/lean4@62b6a229` (a 117-commit community fork of leanprover/lean4) with a hard "Do NOT move this pin" comment, because it was compiling a Lean kernel to WASM and needed `leanc` to emit C whose ABI matched a *prebuilt* link kit published at exactly that sha. The WASM path never produced a working success path — the link-kit archives are `-m32` cross-compiled while the emitted `Kernel.c` is not (runtime OOB crash inside `l_Lean_Json_parse`), and rebuilding Lean itself to wasm32 to match hit an `emscripten`/`lld-22` archive-parsing wall. Nothing needed the fork: the *shipping* package had always used nixpkgs `lean4`; the fork existed only for the two experimental packages. Three transferable facts. (a) **Distinguish what a pin protects from what it merely accompanies.** Read which attributes consume the input, not the comment arguing for it: here `packages.kernel` used `pkgs.lean4` and the fork fed only `lean4-native`/`lean4-wasm`, so removing it cost one build nothing and the other everything it never had. (b) **A cross-artifact ABI match is the expensive kind of pin.** Matching a *prebuilt binary blob's* build identity forces you to reproduce the entire toolchain at one sha — versus matching source-level behaviour, which a version range usually tolerates. When the only reason for a fork is matching a published artifact, price the alternative (drop the WASM goal) before committing. (c) **Delete the scaffolding, not just the goal.** Removing the input, both packages and the devenv script took one pass and left zero dangling references; leaving them "for later" would have kept `nix flake update` pulling an unmaintained fork forever. Corollary for docs: a 400-line investigation log is worth keeping as *history* (real measured detail if the goal returns) but must be capped with an explicit "ABANDONED — describes what was tried, not what builds" banner, or the next reader treats it as the current design.
+
+- 2026-11-05 — **A toolchain bump makes *some* proofs version-dependent; measure first.** Moving a two-library Lean project 4.34.1 → 4.35.0 broke exactly **one** theorem out of ~430: a `conv => lhs; rw [f.eq_def]` that 4.34.1 left with a goal the following `simp only`/`split`/`injection` tail had to close, which 4.35.0 now closes outright — so the tail died with "No goals to be solved". Three transferable facts. (a) **Measure the breakage before touching a pin.** Compile every library against the new toolchain in a scratch copy *first*; here that turned "a version bump" from an unknown into "one line", which is what made the decision cheap. (b) **Make the fix portable, not just green.** The obvious fix (delete the now-dead tail) is green on the new version and **red on the old**; `try`-wrapping is red on the old in a different way (`try simp only` does not admit the `split` the old version still needs). What works on both is `first | (tail) | skip` — run the tail when there is work, no-op when there is not. If a fix must survive both toolchains, test **both directions**, not just the target. **But treat that guard as temporary**: once the old toolchain is dropped, delete it and keep the one-line proof — and then **check the one-liner is not vacuous** by mutating the statement and confirming it fails. A proof that collapses to a single tactic is indistinguishable from one that closed for the wrong reason until you do. (Measured: here the mutation gave `unsolved goals` as it should, and the axiom footprint was unchanged at `[propext, Quot.sound]`.) (c) **A `lake build` segfault right after a bump usually means stale build state.** `lake build bench` aborted with `lean::exception: unsupported IRType` (exit 139) and printed nothing; `lldb` showed the exception on a worker thread, which reads like a toolchain bug. It was `.lake` artifacts from the old toolchain. `rm -rf .lake` and the same command is green. **Clean the build dir before diagnosing any crash that follows a version change**, and treat "prints nothing at all before dying" as evidence about build state rather than about your lakefile.
+
+- 2026-11-05 — **`lean-toolchain` is decorative in a Nix flake; check `lake build -v`.** A repo can pin `leanprover/lean4:v4.30.0` in `lean-toolchain` while every build actually uses nixpkgs' `lean4` at a different version, because `nix develop` puts that `lean` on `PATH`, `default.nix` takes `lean4` as an argument, and **nothing reads the file**. Elan being installed does not change this — its toolchains are shadowed by the `PATH` entry. The check is one command: `lake build <target> -v` and read the `trace: .> LEAN_PATH=… /nix/store/…-lean4-X.Y.Z/bin/lean` line. So before reasoning about "which Lean are we on", distinguish the three independent things: the `lean-toolchain` text, the `flake.lock`'s nixpkgs rev, and the binary that ran. They can all disagree, and only the third one is the build. Corollary for reporting: saying "there's a newer Lean release" when the pin is 18 days behind is noise — check whether the pin has any effect *before* calling it a problem.
+
 - 2026-11-04 — **`lean --run` is the interpreter; the compiled exe is not.** The same call measured **~850–1050 ns/call under `lean --run`** and **86 ns/call** compiled into a `lean_exe` by `lake build` — a **10x** gap, in the direction that makes the *interpreter* look like a finding. Two rules follow. (1) Never paste a `lean --run` figure next to a compiled one, and never quote one as "the cost" when the other is what ships; `#eval`/`lean --run` are for *value* checks and quick reduction, `lake build` + running the binary is for timing. (2) A `probe.lean` compiled ad hoc still links the toolchain's optimized runtime, so "it's just a probe" does not excuse an unlabelled number. This bit hard: a session nearly published "the lane is 10x wrong" on the strength of an interpreter reading, when the lane was right.
 
 - 2026-11-04 — **A sink that is a constant measures nothing: check it varies.** A benchmark whose result is folded into a sink like `(…).length` is *folded away entirely* when that length is constant — for a fixed-arity decoder the candidate count is always `1`, so the optimiser keeps only the fold and reports **3 ns/call for a call that really costs 86**. The failure is silent and it survives a coarse "is the sink zero?" guard, because a nonzero constant passes. **The check is invariance, not non-zero-ness:** evaluate the lane's function over several *distinct inputs* and assert the sink actually differs (`List.eraseDups`, or compare two calls); if it does not, the closure is loop-invariant and the number is not a measurement. Corollary specific to the other facet: varying only the *seed* of the sink while keeping the data argument fixed is **not** enough — the optimiser keeps the computation and only the seed moves. Vary the data. (Companion to the interleaved/burst and per-call-vs-per-byte entries above: all three are ways the harness, not the code, produces the number.)
@@ -771,6 +815,16 @@ paragraphs, not one-liners; keep each one focused on a single transferable fact.
 - 2026-11-03 — **Interleaved benchmarks are cold; a "floor" needs a burst lane.** A harness that interleaves a reference operation (a same-size `memcpy`) with each measured call is *correct* for a ratio to that reference — both sides see the same cache state — and it also **evicts the input between calls**, so what it prints is memory-bound cost. Measured on the identical loop: `arr.getD k` + a `Nat` cursor over 4 KiB is **6 ns/step in a burst** (200 back-to-back calls, input varied per call so nothing hoists) vs **15–16 ns/step interleaved**, a ~2.5× gap that is entirely cache state. A doc had been calling the interleaved figure "the achievable pure-Lean floor" and dividing a cold decode by it, which turned an ~11× gap into a claimed ~3×. **Rule:** a *floor* is a compute claim, so quote it from a burst (input L1-resident, span ≫ the clock's ~41 ns granularity); a *throughput* figure comes from the interleaved lane; report both, label which question each answers, and never divide one by the other. Two corollaries: (a) a single small-buffer call inside an interleaved lane is timing noise, not a measurement — always batch; (b) adding a burst lane will move a previously-quoted floor, and that movement is a finding about the *old* number, not a regression in the code.
 
 - 2026-11-02 — **A benchmark number is sourced because the lane prints it.** A benchmark number is sourced because the lane, run, prints it — not because a lane exists. Three performance rows in a doc were each labelled with the name of a `benchRatio` lane and none of them matched what that lane printed; the rows had been written from an earlier ad-hoc probe and the lanes added later. Worse, two of the lanes were *themselves* wrong, in ways that are generalisable: (a) a "floor" lane that `Array.push`-ed every element into a fresh output array measured the floor **plus n elements of growth** and then quoted the total as "the achievable floor" — it read ~15 ns/step with the push and ~15 without it only once the push was replaced by a `Nat` sink, so the allocation was most of the number; (b) a "per-step" term that built its list **once over the whole input** and let the harness divide by `n` reported ~12 ns/"step" — *below* the 48 ns/step decode it was a component of, an arithmetic impossibility that was visible for several revisions to anyone who compared two rows. **Three checks catch both, and they are cheap:** (i) after adding a lane, paste its literal output next to the quoted figure in the same session — if they differ, the doc is wrong, not the number; (ii) sanity-check every per-step term against the whole it composes — a component cannot exceed its composite unless the composite amortises it, and if it does, it is not a per-step quantity; (iii) read the lane's own body for allocation and for a divisor that does not match what one call does. `benchRatio`'s per-byte division is a footgun for anything that is naturally per-*call*: report those through a plain `ns/op` print instead of manufacturing a denominator.
+
+**Toolchain note (re-verified 2026-11-05).** This file was written against
+Lean 4.34 and our projects are now on **4.35.0**. Every version-pinned claim
+below was re-tested on 4.35.0 and still holds: `split_ifs` is still
+`unknown tactic`; `conv_lhs`/`conv_rhs` still do not exist while `conv => lhs`
+does; `Array.toList_extract`/`Array.getElem_extract` still carry
+`Classical.choice`. So the 4.34 qualifiers are floors, not ceilings — but the
+lesson of 2026-11-05 (first entry in the Append) is that a *proof* can be
+version-dependent even when *these* facts are not, so re-measure rather than
+assume either way.
 
 **Scope, stated once so it can be checked:** everything here is **stdlib-only**
 (no mathlib — so no `split_ifs`, no `omega` extensions, and `exact?`/`apply?` are
