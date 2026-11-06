@@ -196,6 +196,7 @@ add a row (not a new scattered entry) when you find a new shape.
 | **`split` on a `match`-with-a-named-equation**, and **an anonymous `by <tactic>` proof inside a `match` arm** | the unfolding lemma is dirty while its statement and every lemma it cites are clean | Make the bound an **ordinary parameter** rather than something derived by a tactic inside the arm (a subtype's `≤` field passed straight through), after which the `conv => lhs; rw [f.eq_def]; dsimp only; rw [h]` recipe works. Diagnostic: `#print axioms` each cited lemma in turn; if all are clean, the arm or `split` itself is the source. |
 | **`simp`/`rw` reaching a classical lemmas' route** — e.g. `simp [f]` that passes through `List.length_ofFn` | looks like an innocent simp-set choice | Replace with the direct lemma: `show (List.ofFn s).length = n; exact List.length_ofFn` reports `[propext]` where `simp [f]` reported `[propext, Classical.choice, Quot.sound]`. Common at a **transport lemma**, which is exactly where it recurs. |
 | **`omega` on a `Nat`-subtraction trichotomy**, or **`omega` asked to derive a modulo *existential*** | `omega` picks a branch classically | Case-split on `Nat.le_total` first, and state the *equational* form: `n = 4 * k → n % 4 = 0` **is** in `omega`'s fragment and closes clean; `∃ k, n = 4 * k` from `n % 4 = 0` is not, and `omega` cannot *use* a modulo hypothesis. |
+| **`simpa`/`simp` discharging a *dependent index-validity* goal** on a `Fin`/`Array`/`List` bound (2026-11-06) | a transport like `(List.ofFn s)[i.val]'(by simpa using hi) = s _` reports `[propext, Classical.choice, Quot.sound]`; the *same proof* with the bound written out is `[propext, Quot.sound]`. The `Array`/`List` sizing simp set reaches classical logic — the sibling of the `List.length_ofFn` row above, and it recurs at exactly the same place (a transport lemma) | **Never let `simp` discharge an index-validity goal.** Write the `Nat.lt_*` proof: `Nat.lt_of_lt_of_eq i.isLt (size_lemma s)`. Version note: `Array.getElem_mk` and `Array.getElem_eq_getElem_toList` **do not exist** in 4.35.0 — the `Array`→`List` read bridge is `Array.getElem_toList`, applied with `←`; then `List.getElem_ofFn`. |
 | **`Array.extract`'s readback** (`Array.toList_extract`, `Array.getElem_extract`) | both report `[propext, Classical.choice, Quot.sound]` on 4.34 **and still on 4.35.0** (re-checked 2026-11-05), so *every* route that reads an `Array.extract` back as a list inherits it | There is no clean route: design around it. `Array.ext'` is innocent — check the individual lemma, not just the tactic. Honest fallback when the fast transport is worth having is a recorded decision plus a measurement, never a weakened statement and never a `sorry`. |
 
 **Two rules that keep this table honest.**
@@ -351,6 +352,17 @@ resists `simp`/`rcases` when `e` is a free term. To reduce it in a hypothesis `h
 match reduces. For the proof-carrying `getLast h`-style arguments, prefer the `Option`
 variant (`getLast?`) and `List.getLast?_eq_some_iff : xs.getLast? = some a ↔ ∃ ys, xs = ys ++ [a]`
 to avoid a `List ≠ []` proof argument that breaks `rw`'s motive.
+
+**A rewrite under a *dependent argument* is not a `rw`, `subst`, or `generalize`
+(2026-11-06).** Rewriting inside `f h (size) (cast … x)` — where the index and the value
+are both arguments — fails three ways: `rw [show size = n from …]` reports "motive might
+not typecheck"; `subst hs` reports "Dependent elimination failed" when the equation is in
+the wrong orientation; `generalize hk : size = k at *` does not capture the occurrence
+inside the argument at all. The fix is the same one this section states: **change the
+statement, not the tactic.** Prove a helper whose arguments are *abstract*
+(`(k : Nat) (hk : k = n) (a : Bytes k) (ha : a = cast (congrArg Bytes hk.symm) s) :
+f h k a = f h n s := by subst hk; subst ha; rfl`), then feed it the concrete terms. Two
+`subst`s in the orientation the hypotheses were stated in do what no `rw` can.
 
 ### 2c. "Motive is not type correct" — change the *statement*, not the tactic
 
