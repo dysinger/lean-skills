@@ -1,6 +1,6 @@
 ---
 name: lean
-description: Supplements the official `lean4` skill with our own accumulated *generic* Lean 4 / Lake learnings — module & namespace layout, lakefile roots, the `Classical.choice` leak catalogue, `if`/`ite`/`Bool`-goal and "motive is not type correct" recipes, `partial`/coinductive definitions, notation collisions, reducibility (`split`/`unfold` vs structure projections, and `decide`'s reach), verification-gate design (mutation-testing a new check instead of trusting a green run, a check's *denominator* and per-cause removal counts being asserted rather than logged, attributing a natural-language claim to a symbol, detecting "is this body a projection?" by the operand's projection-ness rather than the head constant, a matcher's *vocabulary* being an input filter that needs its own denominator, and asserting a list's *effect* rather than its ordering rule), and performance-measurement discipline (including the *padded range*: a range that excludes its own derivation's endpoints). Use alongside `lean4`. Holds only deltas, never duplicates its content, and only the reusable half — each project keeps its domain-specific notes in its own repository.
+description: 'Supplements the official `lean4` skill with our own accumulated *generic* Lean 4 / Lake learnings — module & namespace layout, lakefile roots, the `Classical.choice` leak catalogue, `if`/`ite`/`Bool`-goal and "motive is not type correct" recipes, `partial`/coinductive definitions, notation collisions, reducibility (`split`/`unfold` vs structure projections, and `decide`''s reach), verification-gate design (mutation-testing a new check instead of trusting a green run, a check''s *denominator* and per-cause removal counts being asserted rather than logged, attributing a natural-language claim to a symbol, detecting "is this body a projection?" by the operand''s projection-ness rather than the head constant, a matcher''s *vocabulary* being an input filter that needs its own denominator, and asserting a list''s *effect* rather than its ordering rule), and performance-measurement discipline (including the *padded range*: a range that excludes its own derivation''s endpoints). Use alongside `lean4`. Holds only deltas, never duplicates its content, and only the reusable half — each project keeps its domain-specific notes in its own repository.'
 license: CC-BY-4.0
 ---
 
@@ -48,6 +48,8 @@ in that order and record the ruling here.
 | **`#print axioms` shows `Classical.choice` and I do not know which spelling caused it** | [§2b the leak catalogue](#2b-classicalchoice-leak-catalogue-one-table) — one table, source → probe → clean spelling. Consult this before any dated Append entry. Note the **two `omega` rows are twins**: closing a goal `omega` must *case-split* leaks whether the goal is a `∨` **or a `∧`** — `f_iff.2 (by omega)` for `lo ≤ c ∧ c ≤ hi` leaks, `f_iff.2 ⟨by omega, by omega⟩` does not (found 2026-11-14, five laws at once). |
 | **`#print axioms` shows `sorryAx`, and I never wrote a `sorry`** | An earlier stage left a stub in the term you are now measuring. `sorryAx` **masks** the footprint you are trying to read, so resolve it before drawing any conclusion about `Classical.choice` — `#print axioms` each cited lemma; the one reporting `[propext, sorryAx]` is the stub. Also worth knowing: a `simp only [...]` set that does not match the actual term shape makes no progress but is *not* an error, so a copied recipe can silently stop firing when the term shape differs. Concrete case (2026-11-05): for a composite `Iso` application leaving `(some (y,u)).bind (fun b => some b.fst) = some x`, adding `Option.some.injEq` to `simp only` does not match that shape — `injection h with hy; subst hy` is what closes it, and the *sibling* combinator's shape (`(some (y,u)).bind fun b => some b.fst`) **is** `simp`-dischargeable, so a recipe copied between two halves of one family can silently stop working. |
 | **`rw` fails with "motive is not type correct"** | [§2c change the statement, not the tactic](#2c-motive-is-not-type-correct--change-the-statement-not-the-tactic) |
+| **`omega could not prove the goal` on a goal that is true and looks arithmetic** | [§2b-bis](#2b-bis-omega-cannot-do-nonlinear--and-the-workaround-is-generalize-then-omega) — the goal is probably **nonlinear** (a product of two variables). `ring`/`ring_nf` do not exist stdlib-only. `generalize <subterm> = p` so the residue is linear, keep `Nat.div_add_mod` as a hypothesis, then `omega`. Also there: a `foldl` that carries an accumulator needs `induction … generalizing acc`, not `acc = 0`. |
+| **A gate wants a theorem mentioning a `def` whose only content is a proved structure field, and the honest proof is `:= rfl`** | [§2d](#2d-a-theorem-written-to-satisfy-a-coverage-gate-is-not-a-law) — **do not write the `rfl`.** A `rfl` on `X.proj = f` where `X := { proj := f }` cannot fail for any edit to `f`, so it is not a law; it converts "the proxy is vacuously satisfiable" into "the gate was gamed" and inflates the theorem count. Leave the `def` allowlisted **with the true reason** instead. |
 | How do I lay out a *library* package's namespace, `lakefile`, roots? | [§1 Module & namespace layout](#1-module--namespace-layout) |
 | `ByteArray` proofs won't reduce / `simp` stalls on a primitive | [§2 Proving over primitives](#2-proving-over-primitives) — and note the version qualifier on the `ByteArray` claim |
 | A `partial def`/recursive combinator won't typecheck | [§3 `partial`, coinduction, nonempty](#3-partial-coinduction-nonempty) |
@@ -375,6 +377,72 @@ statement, not the tactic.** Prove a helper whose arguments are *abstract*
 (`(k : Nat) (hk : k = n) (a : Bytes k) (ha : a = cast (congrArg Bytes hk.symm) s) :
 f h k a = f h n s := by subst hk; subst ha; rfl`), then feed it the concrete terms. Two
 `subst`s in the orientation the hypotheses were stated in do what no `rw` can.
+
+### 2b-bis. `omega` cannot do nonlinear — and the workaround is `generalize`, then `omega`
+
+Not a leak row (it does not produce `Classical.choice`); it produces **"omega could not
+prove the goal"** on a goal that is true and whose parts are all in `omega`'s fragment, because
+the goal contains a *product of two variables*. Measured 2026-11-15 (`basen-radix`, the
+`beVal` bridge). Concrete goal, after `Nat.div_add_mod` has been rewritten in:
+
+```lean
+-- true, but omega cannot: `p` and `acc` are multiplied
+(acc * 256 + b) * p = acc * (p * 256) + b * p
+```
+
+**The recipe that works**, in order:
+
+1. `generalize <nonlinear-subterm> = p` so the *remaining* goal is linear in the new name;
+2. keep the two `Nat.div_add_mod` equations as hypotheses (`have hA := Nat.div_add_mod n 4`);
+3. `omega` now closes the linear residue.
+
+**Two failures worth not repeating.** `ring` and `ring_nf` **do not exist** without mathlib, so
+a nonlinear `Nat` identity has no one-tactic close in stdlib-only code. And `generalize … at *`
+on a `Nat` literal with nested numerals can hit "maximum recursion depth has been reached" —
+prefer `generalize h : expr = x` without `at *`, or `congr 1`-free `show …` restatement.
+
+**Related, and the more common form:** a `List.foldl`-based definition whose recursion starts
+from a **carried accumulator** cannot be characterised by an induction at `acc = 0`. Write the
+lemma as `f (bs) (acc) : bs.foldl g acc = acc * k ^ bs.length + <from-zero form>` with
+`induction bs generalizing acc`. Measured failure: the `acc = 0` form proved fine for `[]` and
+then could not reach the `cons` step, because the step needs the lemma at `acc = b.toNat`.
+
+---
+
+### 2d. A theorem written to satisfy a coverage gate is not a law
+
+This is a **verification-design** lesson, kept next to the leak catalogue because both are
+about "the check is green and the thing it checks is hollow".
+
+**The shape.** A def-coverage arm requires every public `def` to be *mentioned* by some gated
+theorem's type. A `def` whose content is a **structure projection already proved at the
+definition site** cannot be mentioned honestly, because any theorem mentioning it is `:= rfl`.
+Measured 2026-11-15: seven `*BlockIso_apply` theorems of the form
+
+```lean
+theorem bitBlockIso_apply (cs : List UInt8) :
+    BaseN.Base2.bitBlockIso.apply cs = BaseN.Base2.bitBlockApply cs := rfl
+```
+
+where `bitBlockIso := { apply := bitBlockApply, … }`. **No edit to `bitBlockApply` can break
+them** — the projection moves with the field — so they constrain nothing. They were written
+because the arm refused an allowlist drop, which is fitting the measurement rather than
+proving something.
+
+**The rule.** When a gate demands a mention and the honest statement is `rfl`, the answer is
+**not** to write the `rfl`: it is to leave the `def` on the allowlist **with the true reason**
+("`Iso`-law-as-field; the ties constrain the `apply` projection, which *is* named by a gated
+theorem"). That reason is checkable and true. Writing the theorem instead converts "the proxy
+can be satisfied vacuously" (documented, acceptable) into "the gate was actually gamed"
+(not acceptable), and it inflates the public-theorem count, making the law surface *look*
+better while it is unchanged.
+
+**Detection:** `grep -n ':= rfl' ` over the new theorems. A `rfl` proof of `X.proj = f` where
+`X := { proj := f }` is this defect. The tell in review is a commit message that explains the
+theorem by the *gate* ("so the allowlist could drop N entries") rather than by a fact about
+the program.
+
+---
 
 ### 2c. "Motive is not type correct" — change the *statement*, not the tactic
 
