@@ -621,6 +621,30 @@ Three consequences, each of which cost a cycle:
   `native_decide` is a trust escalation — use it only where the project allows it
   (bench/example lanes, never for laws under an axiom gate), and say why in place.
 
+**`split` cannot reduce an `if` whose scrutinee is a *variable*, and a chain of such
+guards is what makes a generic proof look impossible.** A `def` shaped
+`if r = 2 then … else if r = 4 then … else …` does not collapse at a symbolic `r`:
+`split`, `simp`, and `unfold` all leave the whole chain intact, so every downstream
+`omega`/`arith` fails on a goal that still contains it — and the failure reads as "these
+parameters need more hypotheses" when the real problem is that nothing was reduced.
+**The route that works is per-arm at a *literal* argument:** case on the parameter, and in
+each arm `unfold theDef; simp` — every `r = 2`-style test is now decided, so the chain
+collapses to one test — then case *that* test explicitly
+(`ite_eq_left`/`ite_eq_right`) and finish with the arithmetic. Restating the arm's body as
+one `hbody : … = (if test then some … else none) := by unfold theDef; simp` equation at
+the top of the arm is what makes the subsequent rewriting work; trying to `split` the
+unfolded goal directly does not.
+
+**`have := (h).1` on a conjunction discards the second half, and the resulting `omega`
+failure is silent about why.** From `h : lo ≤ c ∧ c ≤ hi`, the destructured form keeps
+only the lower bound; every goal shaped `N + (c - N)` (i.e. every "the value plus its
+offset is the byte" fact) then has no upper bound and `omega` reports a possible
+counterexample. Keep the pair (`have hlt := h` for both bounds) rather than projecting.
+
+**`if_true`/`if_false` are deprecated in Lean 4.35.0** — the spellings are
+`ite_true`/`ite_false`. Under `-DwarningAsError` the old names are build errors, not
+warnings.
+
 **`List.ofFn` equality across two different functions is not `rfl`.**
 `List.ofFn_inj` does not exist under that name; the working form is
 `congr 1; funext i; exact h i.1 i.2`.
@@ -1198,3 +1222,6 @@ the title rather than truncating the body.
 - 2026-11-07 — **Every check must print its denominator *and* its removals decomposed by cause — and both must be asserted.** Ten adversarial review rounds against one 15k-line Lean library found **zero** soundness defects and **fourteen** instances of a single class: *a check whose input has a filter that nothing audits*. The instances were a name list dropping an authorial combinator, a `getPrefix == \`Ns` filter removing 139 declarations, a `(…).length` sink letting the optimiser delete the work, an attribution rule discarding real claims, a constant-kind nobody matched, and a validity rule that existed for one list and not its twin. Each was fixed individually and the class survived, because **fixing an instance does not change the rule a new check is written against**. Two generalisations are worth carrying to any project: (a) **a check that reports a count must also report the universe that count is drawn from** — an arm printing "146 checked" is indistinguishable from one whose walk found 146 items out of 9,000 or out of 146; and (b) **a single removal total is not a decomposition.** One gate printed `skipped = 8`, and the denominator was present and consistent (`146 + 8 = 154`) — so nothing looked wrong. But the eight summed a legitimate survey paragraph together with two claims that had *no resolvable owner at all*, and the two were load-bearing. A total cannot show that a particular cause of removal is rare or absent; only a per-cause count can. **Make both numbers asserted, not logged**: a printed number rots silently, an asserted one fails the build. **And the rule must cover prose enumerations too** — the same round's own task file listed six call sites where there were eight, because the list was written from reading rather than from `grep`; a short list is a completeness claim that fails silently. The durable form of this lesson is a *precondition on adding a check*, not a trap entry: a project where "ask what removes things from your input" is advice accumulates the same defect; one where it is a merge requirement does not.
 
 - 2026-11-07 — **To decide "is this theorem's body a projection?", inspect the *operand*, not the head constant or the arity.** A meta-level check that classified `Prop`-valued structure fields as "not a law" matched `Expr.proj`, and therefore missed every projection Lean elaborates to a *constructor application*: `hal.1` on an `And` is `And.left hal`, and `(i.law a b).1 h` is `Iff.mp`. The obvious repair — accept a spine whose head constant is in `{And.left, And.right, Iff.mp, Iff.mpr, Prod.fst, Prod.snd}` — is **wrong and dangerous**: measured, it also captures a library's central `roundtrip` theorem, whose body is `(bidir d x n s).mp (encode_rel d x he)` — the same head and the same arity as a genuine field selection. **What actually separates them: whether the head constant's *own body* peels to a bare `Expr.proj`.** Every real projection constant in a Lean library is a `proj` (`Iso.law`, `And.left`, `Subtype.property`, `Normal.fixed` all peel to `proj#0`); a proved theorem that merely *has* an `↔`/`∧` in its **result type** is not (`bidir`'s body is a `let`; `Option.ne_none_iff_exists'` is `Iff.trans`). So the working test is: peel `lam`/`mdata`, decompose the spine, and accept when the head is a *projection constant* applied, at its **first explicit declared argument** (read the telescope, `forallE`'s `BinderInfo`), to something recursively a selection from a bound/free variable. Two traps found alongside it: **`args.getLast?` agrees with the correct accessor on a clean tree** — the operand of `And.right h x y` is the *second* argument, so a last-argument rule passes every test and misclassifies any case where a later argument is constructed (this is the "rule that agrees by luck" shape); and **the same predicate written twice five lines apart under a comment saying "one definition, so they cannot drift apart"** is the classic two-copies defect — `run_cmd` blocks cannot share a `let rec`, so hoist it to a top-level `def` before extending it, or the extension lands in one direction only.
+
+
+- 2026-11-15 — **Totalising a partial normaliser by defaulting to its input is the natural move, and it can be semantically wrong.** Given a quotient codomain "the fixed points of `norm : S → S`" and a normaliser that is *partial* (`S → Option S`, because some inputs denote nothing), the obvious totalisation is `normT s := (norm s).getD s` — identity on rejection. It is wrong whenever the corresponding decoder is *also* total, because then every rejected input becomes a fixed point **and** something the decoder reads, so the inverse law demands `rejected = canonical` for values that differ. Measured in a numeric codec: the fold has a by-product `decode [] = some 0` while the normaliser rejects `[]`, so `normT` made `[]` a fixed point and the inverse law demanded `[] = "0"`. The fix is to make the fallback a **canonical value the codomain actually contains**, which turns "every fixed point is a decodable element" into a lemma rather than a hidden assumption. **The reusable question:** for a fallback `f`, if `x` is a fixed point only because `norm` rejected it, is `x` still in the image of the encoder? If not, the fallback is wrong. Idempotence holds either way, so **no test of `norm`'s idempotence can see this defect** — only the inverse law does.
